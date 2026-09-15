@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Carter's Delay — WebMIDI Control System</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-group">
+        <div>
+          <h1>CARTER'S DELAY</h1>
+          <p class="subtitle">Multi-Tap Granular Delay / WebMIDI Control System</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="status-badge" id="midiStatus">
+          <span class="indicator offline" id="statusDot"></span>
+          <span id="statusText">MIDI Disconnected</span>
+        </div>
+        <button id="btnMicInput" class="btn btn-secondary" title="Enable microphone input to record live audio into delay buffer">
+          Mic: <strong id="micState">OFF</strong>
+        </button>
+        <button id="btnWebAudio" class="btn btn-secondary" title="Enable browser Web Audio synth simulation">
+          Synth: <strong id="webAudioState">OFF</strong>
+        </button>
+      </div>
+    </header>
+
+    <!-- MIDI Connection Bar -->
+    <section class="card midi-config-bar">
+      <div class="config-item">
+        <label for="midiOutputSelect">MIDI Output Device</label>
+        <select id="midiOutputSelect" class="form-control">
+          <option value="">Scanning MIDI devices...</option>
+        </select>
+      </div>
+
+      <div class="config-item">
+        <label for="midiChannelMode">Channel Routing Mode</label>
+        <select id="midiChannelMode" class="form-control">
+          <option value="multi">Multi-Channel Mode (Ch 1: Main, Ch 2: FB, Ch 3: Grain)</option>
+          <option value="ch1">Single Channel Mode (All on Channel 1)</option>
+        </select>
+      </div>
+
+      <div class="config-item action-buttons">
+        <button id="btnPanic" class="btn btn-outline">MUTE ALL</button>
+        <button id="btnSendAll" class="btn btn-primary">Sync All Controls</button>
+      </div>
+    </section>
+
+    <!-- Visualizer Scope Panel -->
+    <section class="card visualizer-card">
+      <div class="card-header">
+        <div>
+          <h2>Delay Engine Scope (16 Overlaid Grain Slices & Buffer Playheads)</h2>
+          <span class="scope-subtitle">X Axis: Buffer Timeline • Y Axis: Pan LFO (Up = Left / Down = Right) • Double-click any slider to reset</span>
+        </div>
+        <span class="mono-badge">GRAIN SCOPE VIEW</span>
+      </div>
+      <div class="visualizer-content">
+        <canvas id="scopeCanvas"></canvas>
+        <div class="scope-legend">
+          <span class="legend-item"><span class="box rec-box"></span> Record Head (Writing Audio)</span>
+          <span class="legend-item"><span class="box wave-box"></span> Recorded Audio Waveform</span>
+          <span class="legend-item"><span class="box slice-box"></span> 16 Overlaid Grain Slices (Up = Left / Down = Right)</span>
+          <span class="legend-item"><span class="box playhead-box"></span> Grain Playheads (Scanning at Grain Rates)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3 Channel Control Grid -->
+    <div class="channels-grid">
+
+      <!-- CHANNEL 1: Main Routing & Levels -->
+      <section class="card channel-card">
+        <div class="card-header">
+          <div class="ch-tag">CH 1</div>
+          <h2>Main Levels & Master Output</h2>
+        </div>
+        
+        <div class="controls-list">
+          <!-- Master Output Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc7_masterVol">Master Output Level</label>
+                <span class="cc-badge">CC 7</span>
+              </span>
+              <span class="val-disp" id="val_cc7_ch1">1.0x (Unity)</span>
+            </div>
+            <input type="range" id="cc7_masterVol" min="0" max="127" value="51" class="slider" data-default="51">
+            <div class="sub-info">Master level with softclip boost (0.0x to 2.5x gain)</div>
+          </div>
+
+          <!-- Input Passthrough Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc1_passthru">Input Passthrough Level</label>
+                <span class="cc-badge">CC 1</span>
+              </span>
+              <span class="val-disp" id="val_cc1_ch1">50%</span>
+            </div>
+            <div class="slider-row">
+              <input type="range" id="cc1_passthru" min="0" max="127" value="64" class="slider" data-default="64">
+              <button class="btn btn-toggle active" id="btn_cc4" data-note="60" data-cc="4">
+                MUTE
+              </button>
+            </div>
+            <div class="sub-info">Direct mic audio to output (CC 4 / Note 60 to Mute)</div>
+          </div>
+
+          <!-- Delay Input Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc2_delayIn">Delay Input Level</label>
+                <span class="cc-badge">CC 2</span>
+              </span>
+              <span class="val-disp" id="val_cc2_ch1">50%</span>
+            </div>
+            <div class="slider-row">
+              <input type="range" id="cc2_delayIn" min="0" max="127" value="64" class="slider" data-default="64">
+              <button class="btn btn-toggle active" id="btn_cc5" data-note="61" data-cc="5">
+                MUTE
+              </button>
+            </div>
+            <div class="sub-info">Mic input recorded into buffer (CC 5 / Note 61 to Mute)</div>
+          </div>
+
+          <!-- Buffer Preserve Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc3_preserve">Buffer Sound Preservation</label>
+                <span class="cc-badge">CC 3</span>
+              </span>
+              <span class="val-disp" id="val_cc3_ch1">50%</span>
+            </div>
+            <input type="range" id="cc3_preserve" min="0" max="127" value="64" class="slider" data-default="64">
+            <div class="sub-info">Sound-on-sound retention (preLevel) when recording over buffer</div>
+          </div>
+
+          <!-- Delay Output Mute -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label>Delay Output Master Switch</label>
+                <span class="cc-badge">CC 6 / Note 62</span>
+              </span>
+            </div>
+            <button class="btn btn-toggle active full-width" id="btn_cc6" data-note="62" data-cc="6">
+              DELAY OUTPUT ACTIVE
+            </button>
+            <div class="sub-info">Master toggle for all 16 granular tap outputs</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHANNEL 2: Feedback Loop Patch Mixer -->
+      <section class="card channel-card">
+        <div class="card-header">
+          <div class="ch-tag">CH 2</div>
+          <h2>Feedback Patch Mixer</h2>
+        </div>
+
+        <div class="controls-list">
+          <!-- Feedback Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc1_fbAmp">Feedback Level</label>
+                <span class="cc-badge">CC 1</span>
+              </span>
+              <span class="val-disp" id="val_cc1_ch2">0%</span>
+            </div>
+            <input type="range" id="cc1_fbAmp" min="0" max="127" value="0" class="slider" data-default="0">
+            <div class="sub-info">Output recirculated into input bus via softclip</div>
+          </div>
+
+          <!-- Feedback Balance -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc2_fbBal">Feedback Balance (Pan)</label>
+                <span class="cc-badge">CC 2</span>
+              </span>
+              <span class="val-disp" id="val_cc2_ch2">Center</span>
+            </div>
+            <input type="range" id="cc2_fbBal" min="0" max="127" value="64" class="slider" data-default="64">
+            <div class="sub-info">Stereo pan balance of feedback path (-1.0 to +1.0)</div>
+          </div>
+
+          <!-- Feedback Highpass Hz -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc3_fbHp">Highpass Filter Hz</label>
+                <span class="cc-badge">CC 3</span>
+              </span>
+              <span class="val-disp" id="val_cc3_ch2">12 Hz</span>
+            </div>
+            <input type="range" id="cc3_fbHp" min="0" max="127" value="12" class="slider" data-default="12">
+            <div class="sub-info">Low-cut frequency filter in feedback loop (0 to 220 Hz)</div>
+          </div>
+
+          <!-- Pink Noise Level -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc4_fbNoise">Pink Noise Injection</label>
+                <span class="cc-badge">CC 4</span>
+              </span>
+              <span class="val-disp" id="val_cc4_ch2">0%</span>
+            </div>
+            <input type="range" id="cc4_fbNoise" min="0" max="127" value="0" class="slider" data-default="0">
+            <div class="sub-info">Inject noise floor into feedback loop</div>
+          </div>
+
+          <!-- Sine Generator Level & Frequency -->
+          <div class="control-group-pair">
+            <div class="control-group">
+              <div class="control-label-row">
+                <span class="label-title-group">
+                  <label for="cc5_fbSineLvl">Sine Level</label>
+                  <span class="cc-badge">CC 5</span>
+                </span>
+                <span class="val-disp" id="val_cc5_ch2">0%</span>
+              </div>
+              <input type="range" id="cc5_fbSineLvl" min="0" max="127" value="0" class="slider" data-default="0">
+            </div>
+
+            <div class="control-group">
+              <div class="control-label-row">
+                <span class="label-title-group">
+                  <label for="cc6_fbSinePitch">Sine Frequency</label>
+                  <span class="cc-badge">CC 6</span>
+                </span>
+                <span class="val-disp" id="val_cc6_ch2">55 Hz</span>
+              </div>
+              <input type="range" id="cc6_fbSinePitch" min="0" max="127" value="30" class="slider" data-default="30">
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHANNEL 3: Granular Time & Tap Engine -->
+      <section class="card channel-card">
+        <div class="card-header">
+          <div class="ch-tag">CH 3</div>
+          <h2>Granular Time & Tap Engine</h2>
+        </div>
+
+        <div class="controls-list">
+          <!-- Playback Rate Multiplier (CC 1) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc1_grainRate">Playback Rate Multiplier</label>
+                <span class="cc-badge">CC 1</span>
+              </span>
+              <span class="val-disp" id="val_cc1_ch3">1.0x</span>
+            </div>
+            <input type="range" id="cc1_grainRate" min="0" max="127" value="64" class="slider" data-default="64">
+            <div class="sub-info">Scale playback speed across all 16 taps (0.25x to 2.0x)</div>
+          </div>
+
+          <!-- Grain Density Multiplier (CC 2) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc2_grainDens">Grain Density Multiplier</label>
+                <span class="cc-badge">CC 2</span>
+              </span>
+              <span class="val-disp" id="val_cc2_ch3">1.0x</span>
+            </div>
+            <input type="range" id="cc2_grainDens" min="0" max="127" value="64" class="slider" data-default="64">
+            <div class="sub-info">Adjust grain triggering density and overlap factor</div>
+          </div>
+
+          <!-- Low-Pass Filter Cutoff (CC 3) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc3_cutoff">Low-Pass Filter Cutoff</label>
+                <span class="cc-badge">CC 3</span>
+              </span>
+              <span class="val-disp" id="val_cc3_ch3">12000 Hz</span>
+            </div>
+            <input type="range" id="cc3_cutoff" min="0" max="127" value="100" class="slider" data-default="100">
+            <div class="sub-info">Cutoff frequency on granular output</div>
+          </div>
+
+          <!-- Buffer Record Freeze Toggle (CC 8 / Note 63) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label>Buffer Record Freeze</label>
+                <span class="cc-badge">CC 8 / Note 63</span>
+              </span>
+            </div>
+            <button class="btn btn-toggle full-width" id="btn_freeze" data-note="63" data-cc="8">
+              RECORDING ACTIVE (FREEZE OFF)
+            </button>
+            <div class="sub-info">Hold current audio in memory by pausing write pointer</div>
+          </div>
+
+          <!-- Independent Pitch Interval Toggles (CC 9, 10, 11, 12) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label>Pitch Intervals & Direction</label>
+              </span>
+              <span class="val-disp" id="val_intervals_status">Default [1/4..2/1]</span>
+            </div>
+            <div class="toggle-btn-grid">
+              <button class="btn-matrix-toggle" id="btn_octaves" data-cc="9">
+                + Octaves [2:1]
+              </button>
+              <button class="btn-matrix-toggle" id="btn_fifths" data-cc="10">
+                + 5ths & 4ths [3:2, 4:3]
+              </button>
+              <button class="btn-matrix-toggle" id="btn_suboctaves" data-cc="11">
+                + Sub-Octaves [1:2, 1:4]
+              </button>
+              <button class="btn-matrix-toggle" id="btn_reverse" data-cc="12">
+                Reverse Grains [-1.0x]
+              </button>
+            </div>
+            <div class="sub-info">Mix & match: CC 9 Octaves, CC 10 5ths/4ths, CC 11 Sub, CC 12 Reverse</div>
+          </div>
+
+          <!-- Position Jitter / Spread (CC 4) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc4_jumble">Position Jitter / Spread</label>
+                <span class="cc-badge">CC 4</span>
+              </span>
+              <span class="val-disp" id="val_cc4_ch3">0.00s (Default)</span>
+            </div>
+            <input type="range" id="cc4_jumble" min="0" max="127" value="0" class="slider" data-default="0">
+            <div class="sub-info">Random offset added to grain read pointers (0.0 to 2.5s)</div>
+          </div>
+
+          <!-- Trigger Distribution (CC 5) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc5_sync">Trigger Distribution</label>
+                <span class="cc-badge">CC 5</span>
+              </span>
+              <span class="val-disp" id="val_cc5_ch3">Periodic (Default)</span>
+            </div>
+            <input type="range" id="cc5_sync" min="0" max="127" value="127" class="slider" data-default="127">
+            <div class="sub-info">0% = Poisson (Dust) • 100% = Periodic (Impulse)</div>
+          </div>
+
+          <!-- Grain Window Function (CC 6) -->
+          <div class="control-group">
+            <div class="control-label-row">
+              <span class="label-title-group">
+                <label for="cc6_envShape">Grain Window Function</label>
+                <span class="cc-badge">CC 6</span>
+              </span>
+              <span class="val-disp" id="val_cc6_ch3">Hanning (Default)</span>
+            </div>
+            <input type="range" id="cc6_envShape" min="0" max="127" value="0" class="slider" data-default="0">
+            <div class="sub-info">0: Hanning Bell • 1: Decaying Percussive Saw • 2: Reverse Attack Swell</div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- MIDI Monitor & Reference Grid -->
+    <div class="bottom-grid">
+      <!-- MIDI Monitor Console -->
+      <section class="card monitor-card">
+        <div class="card-header">
+          <h2>WebMIDI Live Monitor Log</h2>
+          <button id="btnClearLog" class="btn btn-sm btn-secondary">Clear</button>
+        </div>
+        <div class="log-container" id="logContainer">
+          <div class="log-entry system">[System] Waiting for WebMIDI connection...</div>
+        </div>
+      </section>
+
+      <!-- Channel Mapping Quick Reference -->
+      <section class="card ref-card">
+        <div class="card-header">
+          <h2>MIDI Channel & CC Reference Map</h2>
+        </div>
+        <table class="ref-table">
+          <thead>
+            <tr>
+              <th>Channel</th>
+              <th>CC / Note</th>
+              <th>Target Parameter</th>
+              <th>Data Range</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 7</code></td>
+              <td>Master Output Level</td>
+              <td>0..127 (0.0x to 2.5x gain)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 1</code></td>
+              <td>Input Passthrough Level</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 2</code></td>
+              <td>Delay Input Level</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 3</code></td>
+              <td>Buffer Sound Preservation</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 4 / Note 60</code></td>
+              <td>Passthrough Mute Toggle</td>
+              <td>0 / 127</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 5 / Note 61</code></td>
+              <td>Delay Input Mute Toggle</td>
+              <td>0 / 127</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 1</span></td>
+              <td><code>CC 6 / Note 62</code></td>
+              <td>Delay Output Master Toggle</td>
+              <td>0 / 127</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 1</code></td>
+              <td>Feedback Level</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 2</code></td>
+              <td>Feedback Balance (Pan)</td>
+              <td>0..127 (-1.0 to +1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 3</code></td>
+              <td>Feedback Highpass Hz</td>
+              <td>0..127 (0 to 220 Hz)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 4</code></td>
+              <td>Pink Noise Level</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 5</code></td>
+              <td>Sine Level</td>
+              <td>0..127 (0.0 to 1.0)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 2</span></td>
+              <td><code>CC 6</code></td>
+              <td>Sine Frequency</td>
+              <td>0..127 (MIDI Note 20..90)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 1</code></td>
+              <td>Playback Rate Multiplier</td>
+              <td>0..127 (0.25x to 2.0x)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 2</code></td>
+              <td>Grain Density Multiplier</td>
+              <td>0..127 (0.2x to 3.0x)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 3</code></td>
+              <td>Low-Pass Filter Cutoff</td>
+              <td>0..127 (200 to 16000 Hz)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 8 / Note 63</code></td>
+              <td>Buffer Record Freeze</td>
+              <td>0 = Live Sweep, 127 = Memory Hold</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 9</code></td>
+              <td>Octaves Toggle [2:1]</td>
+              <td>0 = Off, 127 = On</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 10</code></td>
+              <td>5ths & 4ths Toggle [3:2, 4:3]</td>
+              <td>0 = Off, 127 = On</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 11</code></td>
+              <td>Sub-Octaves Toggle [1:2, 1:4]</td>
+              <td>0 = Off, 127 = On</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 12</code></td>
+              <td>Reverse Grains Toggle [-1.0x]</td>
+              <td>0 = Forward, 127 = Reverse</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 4</code></td>
+              <td>Position Jitter / Spread</td>
+              <td>0..127 (0.0 to 2.5s jitter)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 5</code></td>
+              <td>Trigger Distribution</td>
+              <td>0..127 (0 = Poisson, 127 = Periodic)</td>
+            </tr>
+            <tr>
+              <td><span class="mono-badge">Ch 3</span></td>
+              <td><code>CC 6</code></td>
+              <td>Grain Window Function</td>
+              <td>Hanning / Percussive / Reverse Swell</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
