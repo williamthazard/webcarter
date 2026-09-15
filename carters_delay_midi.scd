@@ -1,6 +1,5 @@
 /*
-   Carter's Delay - WebMIDI Controlled Version (Layered Additive Interval Buffers)
-   Based on Carter's Delay by William Hazard (https://github.com/williamthazard/carters-delay-norns)
+   Carter's Delay - WebMIDI Controlled Version
 
    MIDI Channel & CC Mapping Architecture:
    ---------------------------------------------------------------------
@@ -389,9 +388,9 @@ s.waitForBoot({
 			var ptr, ptrRand, totalDelay, maxGrainDur, grainTrigger;
 
 			env = EnvGen.kr(Env.asr(atk, 1, rel), gate, doneAction: 2);
-			
+
 			grainTrigger = (Dust.ar(dens) * (1 - sync)) + (Impulse.ar(dens) * sync);
-			
+
 			durCtrl = baseDur * LFNoise1.ar(100).exprange(1 / durRand, durRand);
 			rateCtrl = rate.lag3(0.5) * LFNoise1.ar(100).exprange(1 / rateRand, rateRand);
 			panCtrl = pan + LFNoise1.kr(100).bipolar(panRand);
