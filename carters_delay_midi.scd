@@ -313,7 +313,7 @@ MIDIIn.noteOn  = { |src, chan, num, val| handleNote.(chan, num, val) };
 
 s.waitForBoot({
 	Routine({
-		"=== Loading Carter's Delay Soundscape Engine... ===".postln;
+		"=== Loading Carter's Delay Engine... ===".postln;
 
 		// Custom Grain Envelope Windows (512-sample buffers)
 		envBufs = [
