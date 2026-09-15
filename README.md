@@ -1,6 +1,6 @@
 # Carter's Delay — WebMIDI Edition
 
-A WebMIDI-controlled multi-tap granular delay system based on William Hazard's [Carter's Delay](https://github.com/williamthazard/carters-delay-norns), adapted from monome norns OSC control to standard WebMIDI CC and Note controls.
+A WebMIDI-controlled multi-tap granular delay system based on [Carter's Delay](https://github.com/williamthazard/carters-delay-norns), adapted from monome norns OSC control to standard WebMIDI CC and Note controls.
 
 This project includes:
 1. **`carters_delay_midi.scd`**: SuperCollider audio engine script listening to MIDI CCs and Notes.
