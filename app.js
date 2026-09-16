@@ -111,6 +111,39 @@
     freeze: false      // Ch 3 CC 8 / Note 63 (False Default)
   };
 
+  // Persistence: Save/Restore All Settings via localStorage
+  const SETTINGS_STORAGE_KEY = "cartersDelay.settings.v1";
+
+  function loadSavedSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      console.warn("Could not load saved settings:", e);
+      return null;
+    }
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+        state,
+        intervalToggles,
+        channelMode,
+        midiOutputName: midiOutput ? midiOutput.name : null
+      }));
+    } catch (e) {
+      console.warn("Could not save settings:", e);
+    }
+  }
+
+  const savedSettings = loadSavedSettings();
+  if (savedSettings) {
+    if (savedSettings.state) Object.assign(state, savedSettings.state);
+    if (savedSettings.intervalToggles) Object.assign(intervalToggles, savedSettings.intervalToggles);
+    if (savedSettings.channelMode) channelMode = savedSettings.channelMode;
+  }
+
   // 512-Point Ring Buffer for Recording Audio Waveform
   const bufferLength = 512;
   const audioRingBuffer = new Float32Array(bufferLength);
@@ -196,13 +229,17 @@
     }
 
     let defaultIndex = 0;
+    let matchedSavedDevice = false;
     outputs.forEach((output, idx) => {
       const opt = document.createElement("option");
       opt.value = output.id;
       opt.textContent = output.name;
       midiOutputSelect.appendChild(opt);
 
-      if (output.name.includes("IAC") || output.name.includes("Bus 1")) {
+      if (savedSettings && savedSettings.midiOutputName && output.name === savedSettings.midiOutputName) {
+        defaultIndex = idx;
+        matchedSavedDevice = true;
+      } else if (!matchedSavedDevice && (output.name.includes("IAC") || output.name.includes("Bus 1"))) {
         defaultIndex = idx;
       }
     });
@@ -238,12 +275,14 @@
       statusDotEl.className = "indicator online";
       statusTextEl.textContent = "Connected: " + midiOutput.name;
       log(`Switched to Output: ${midiOutput.name} (${midiOutput.connection})`, "system");
+      saveSettings();
     }
   });
 
   midiChannelModeSelect.addEventListener("change", (e) => {
     channelMode = e.target.value;
     log("Channel Mode: " + e.target.options[e.target.selectedIndex].text, "system");
+    saveSettings();
   });
 
   function getChannel(targetCh) {
@@ -365,11 +404,13 @@
     function setupResetableSlider(sliderEl, onUpdate) {
       sliderEl.addEventListener("input", (e) => {
         onUpdate(parseInt(e.target.value, 10));
+        saveSettings();
       });
       sliderEl.addEventListener("dblclick", () => {
         const def = parseInt(sliderEl.getAttribute("data-default") || "64", 10);
         sliderEl.value = def;
         onUpdate(def);
+        saveSettings();
         log(`Reset ${sliderEl.id} to default (${def})`, "system");
       });
     }
@@ -400,6 +441,7 @@
       btnCc4.textContent = state.passMute ? "MUTE" : "MUTED";
       sendCC(1, 4, state.passMute ? 127 : 0, "Passthrough Mute CC");
       sendNote(1, 60, state.passMute ? 127 : 0, "Passthrough Mute Note");
+      saveSettings();
     });
 
     const cc2_delayIn = document.getElementById("cc2_delayIn");
@@ -417,6 +459,7 @@
       btnCc5.textContent = state.delayInMute ? "MUTE" : "MUTED";
       sendCC(1, 5, state.delayInMute ? 127 : 0, "Delay Input Mute CC");
       sendNote(1, 61, state.delayInMute ? 127 : 0, "Delay Input Mute Note");
+      saveSettings();
     });
 
     const cc3_preserve = document.getElementById("cc3_preserve");
@@ -434,6 +477,7 @@
       btnCc6.textContent = state.delayOutMute ? "DELAY OUTPUT ACTIVE" : "DELAY OUTPUT MUTED";
       sendCC(1, 6, state.delayOutMute ? 127 : 0, "Delay Output Mute CC");
       sendNote(1, 62, state.delayOutMute ? 127 : 0, "Delay Output Mute Note");
+      saveSettings();
     });
 
     // Channel 2: Feedback Controls
@@ -498,6 +542,7 @@
       btnFreeze.textContent = state.freeze ? "RECORDING FROZEN (MEMORY HELD)" : "RECORDING ACTIVE (FREEZE OFF)";
       sendCC(3, 8, state.freeze ? 127 : 0, "Buffer Record Freeze CC");
       sendNote(3, 63, state.freeze ? 127 : 0, "Buffer Record Freeze Note");
+      saveSettings();
     });
 
     // Independent Additive Interval Toggles (CC 9, 10, 11, 12)
@@ -518,6 +563,7 @@
       btnOctaves.classList.toggle("active", intervalToggles.octaves);
       updateIntervalStatusText();
       sendCC(3, 9, intervalToggles.octaves ? 127 : 0, "Pitch Octaves Toggle");
+      saveSettings();
     });
 
     const btnFifths = document.getElementById("btn_fifths");
@@ -526,6 +572,7 @@
       btnFifths.classList.toggle("active", intervalToggles.fifths);
       updateIntervalStatusText();
       sendCC(3, 10, intervalToggles.fifths ? 127 : 0, "Pitch 5ths & 4ths Toggle");
+      saveSettings();
     });
 
     const btnSuboctaves = document.getElementById("btn_suboctaves");
@@ -534,6 +581,7 @@
       btnSuboctaves.classList.toggle("active", intervalToggles.suboctaves);
       updateIntervalStatusText();
       sendCC(3, 11, intervalToggles.suboctaves ? 127 : 0, "Pitch Sub-Octaves Toggle");
+      saveSettings();
     });
 
     const btnReverse = document.getElementById("btn_reverse");
@@ -542,6 +590,7 @@
       btnReverse.classList.toggle("active", intervalToggles.reverse);
       updateIntervalStatusText();
       sendCC(3, 12, intervalToggles.reverse ? 127 : 0, "Reverse Grains Toggle");
+      saveSettings();
     });
 
     // Pointer Position Jitter / Spread (CC 4)
@@ -646,6 +695,84 @@
       val_cc2_ch1.textContent = "0%";
       val_cc1_ch2.textContent = "0%";
     });
+
+    // Restore Slider Positions, Toggle States & Display Labels from Loaded Settings
+    function restoreControlsFromState() {
+      cc7_masterVol.value = state.masterVol;
+      val_cc7_ch1.textContent = `${(state.masterVol / 51).toFixed(2)}x (${state.masterVol <= 51 ? 'Normal' : 'Boost'})`;
+
+      cc1_passthru.value = state.passLevel;
+      val_cc1_ch1.textContent = Math.round((state.passLevel / 127) * 100) + "%";
+
+      btnCc4.classList.toggle("active", state.passMute);
+      btnCc4.textContent = state.passMute ? "MUTE" : "MUTED";
+
+      cc2_delayIn.value = state.delayInLevel;
+      val_cc2_ch1.textContent = Math.round((state.delayInLevel / 127) * 100) + "%";
+
+      btnCc5.classList.toggle("active", state.delayInMute);
+      btnCc5.textContent = state.delayInMute ? "MUTE" : "MUTED";
+
+      cc3_preserve.value = state.preserveLevel;
+      val_cc3_ch1.textContent = Math.round((state.preserveLevel / 127) * 100) + "%";
+
+      btnCc6.classList.toggle("active", state.delayOutMute);
+      btnCc6.textContent = state.delayOutMute ? "DELAY OUTPUT ACTIVE" : "DELAY OUTPUT MUTED";
+
+      cc1_fbAmp.value = state.fbLevel;
+      val_cc1_ch2.textContent = Math.round((state.fbLevel / 127) * 100) + "%";
+
+      cc2_fbBal.value = state.fbBalance;
+      const balNorm = (state.fbBalance - 64) / 64;
+      val_cc2_ch2.textContent = balNorm === 0 ? "Center" : balNorm < 0 ? "L " + Math.abs(Math.round(balNorm * 100)) + "%" : "R " + Math.round(balNorm * 100) + "%";
+
+      cc3_fbHp.value = state.fbHp;
+      val_cc3_ch2.textContent = Math.round((state.fbHp / 127) * 220) + " Hz";
+
+      cc4_fbNoise.value = state.fbNoise;
+      val_cc4_ch2.textContent = Math.round((state.fbNoise / 127) * 100) + "%";
+
+      cc5_fbSineLvl.value = state.fbSineLevel;
+      val_cc5_ch2.textContent = Math.round((state.fbSineLevel / 127) * 100) + "%";
+
+      cc6_fbSinePitch.value = state.fbSinePitch;
+      const midiNote = Math.round(20 + (state.fbSinePitch / 127) * 70);
+      val_cc6_ch2.textContent = Math.round(440 * Math.pow(2, (midiNote - 69) / 12)) + " Hz";
+
+      btnFreeze.classList.toggle("active", state.freeze);
+      btnFreeze.textContent = state.freeze ? "RECORDING FROZEN (MEMORY HELD)" : "RECORDING ACTIVE (FREEZE OFF)";
+
+      btnOctaves.classList.toggle("active", intervalToggles.octaves);
+      btnFifths.classList.toggle("active", intervalToggles.fifths);
+      btnSuboctaves.classList.toggle("active", intervalToggles.suboctaves);
+      btnReverse.classList.toggle("active", intervalToggles.reverse);
+      updateIntervalStatusText();
+
+      cc4_jumble.value = state.jumble;
+      val_cc4_ch3.textContent = `${((state.jumble / 127) * 2.5).toFixed(2)}s ${state.jumble === 0 ? '(Default)' : ''}`;
+
+      cc5_sync.value = state.syncMode;
+      val_cc5_ch3.textContent = state.syncMode === 127 ? "Periodic (Default)" : state.syncMode === 0 ? "Poisson (Dust)" : `Continuous (${Math.round((state.syncMode / 127) * 100)}%)`;
+
+      cc6_envShape.value = state.envShape;
+      val_cc6_ch3.textContent = envWindows[Math.min(2, Math.floor(state.envShape / 43))];
+
+      cc1_grainRate.value = state.grainRate;
+      val_cc1_ch3.textContent = (0.25 + (state.grainRate / 127) * 1.75).toFixed(2) + "x";
+
+      cc2_grainDens.value = state.grainDens;
+      val_cc2_ch3.textContent = (0.2 + (state.grainDens / 127) * 2.8).toFixed(2) + "x";
+
+      cc3_cutoff.value = state.cutoff;
+      val_cc3_ch3.textContent = Math.round(200 * Math.pow(80, state.cutoff / 127)) + " Hz";
+
+      midiChannelModeSelect.value = channelMode;
+    }
+
+    restoreControlsFromState();
+    if (savedSettings) {
+      log("Restored settings from previous session (localStorage). Use \"Send All\" once your MIDI output is connected to sync the engine.", "system");
+    }
   }
 
   /**
