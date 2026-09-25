@@ -159,7 +159,12 @@
       lfoSpeed: lfoSpeed,
       playheadProgress: Math.random(),
       panPhase: Math.random() * Math.PI * 2,
-      pan: 0
+      pan: 0,
+      // Per-tap amplitude LFO (LFNoise1-style linear interpolation)
+      // Simulates the SC ampLFOs that make taps organically fade in and out
+      ampLfo: 0.4 + Math.random() * 0.6,
+      ampLfoTarget: 0.4 + Math.random() * 0.6,
+      ampLfoRate: 0.002 + Math.random() * 0.012
     };
   });
 
@@ -1112,17 +1117,26 @@
       tap.panPhase += tap.lfoSpeed;
       tap.pan = Math.sin(tap.panPhase);
 
+      // Advance amplitude LFO (LFNoise1-style: linear interp toward random target)
+      if (Math.abs(tap.ampLfo - tap.ampLfoTarget) < tap.ampLfoRate) {
+        tap.ampLfoTarget = 0.15 + Math.random() * 0.85;
+      }
+      tap.ampLfo += Math.sign(tap.ampLfoTarget - tap.ampLfo) * tap.ampLfoRate;
+
       const maxPanOffsetY = (height / 2) - 24;
       const sliceY = (centerY - (tap.pan * maxPanOffsetY)) - (sliceHeight / 2);
 
-      // Reactivity to Filter Cutoff (brightness) & Freeze
+      // Reactivity to Filter Cutoff (brightness), Freeze, and per-tap ampLfo (opacity)
       const cutoffBrightness = Math.round(30 + (state.cutoff / 127) * 35);
+      const tapAlpha = state.delayOutMute ? tap.ampLfo : 0.15;
       if (state.delayOutMute) {
-        ctx.fillStyle = state.freeze ? "rgba(80, 80, 80, 0.8)" : `rgba(${cutoffBrightness}, ${cutoffBrightness}, ${cutoffBrightness}, 0.65)`;
-        ctx.strokeStyle = state.freeze ? "#ffffff" : (isReverse ? "#e0e0e0" : "#888888");
+        ctx.fillStyle = state.freeze
+          ? `rgba(80, 80, 80, ${(tapAlpha * 0.9).toFixed(2)})`
+          : `rgba(${cutoffBrightness}, ${cutoffBrightness}, ${cutoffBrightness}, ${(tapAlpha * 0.75).toFixed(2)})`;
+        ctx.strokeStyle = state.freeze ? `rgba(255, 255, 255, ${tapAlpha.toFixed(2)})` : (isReverse ? `rgba(224, 224, 224, ${tapAlpha.toFixed(2)})` : `rgba(136, 136, 136, ${tapAlpha.toFixed(2)})`);
       } else {
-        ctx.fillStyle = "rgba(15, 15, 15, 0.4)";
-        ctx.strokeStyle = "#333333";
+        ctx.fillStyle = "rgba(15, 15, 15, 0.15)";
+        ctx.strokeStyle = "#222222";
       }
       ctx.lineWidth = 1;
 

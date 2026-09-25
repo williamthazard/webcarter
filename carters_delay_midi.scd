@@ -1,5 +1,7 @@
 /*
    Carter's Delay - WebMIDI Controlled Version
+   Additive Interval Toggles, LFNoise1 Modulation, Limiter Master Output
+   Based on Carter's Delay by William Hazard (https://github.com/williamthazard/carters-delay-norns)
 
    MIDI Channel & CC Mapping Architecture:
    ---------------------------------------------------------------------
@@ -32,12 +34,17 @@
      - CC 10: Pitch 5ths & 4ths Toggle [+3:2, +4:3] (0 = Off, 127 = Adds 5th & 4th Taps)
      - CC 11: Pitch Sub-Octaves Toggle [+1:2, +1:4] (0 = Off, 127 = Adds Sub-Octave Taps)
      - CC 12: Reverse Grains Toggle [Adds -1.0x, -0.5x] (0 = Forward Only, 127 = Forward AND Reverse Taps)
+
+   Gain Staging:
+     Per-tap ampLFOs (LFNoise1, range 1..3) modulate individual grain character.
+     masterVol (CC 7) scales the combined output BEFORE the brick-wall Limiter.
+     Push CC 7 above 1.0x to drive the Limiter harder for maximum perceived loudness.
    ---------------------------------------------------------------------
 */
 
 (
 var oscs, b, timer, micBus, ptrBus, granBus, micGrp, ptrGrp, recGrp, granGrp, outGrp;
-var panLFOs, cutoffLFOs, resonanceLFOs, envBufs;
+var panLFOs, ampLFOs, cutoffLFOs, resonanceLFOs, envBufs;
 var micSynth, micPassSynth, ptrSynth, recSynth, fbSynth, masterOutSynth, granSynths;
 var passLevel = 0.5, passMute = 1;
 var delayInLevel = 0.5, delayInMute = 1;
@@ -54,7 +61,7 @@ MIDIIn.connectAll;
 
 "=== CoreMIDI Connected ===".postln;
 MIDIClient.sources.do({ |src, idx|
-	("  [MIDI Src " ++ idx ++ "] " ++ src.name ++ " (" ++ src.device ++ ")").postln;
+	(" [MIDI Src " ++ idx ++ "] " ++ src.name ++ " (" ++ src.device ++ ")").postln;
 });
 
 // Configure Server memory
@@ -74,15 +81,12 @@ updateAllTapRates = {
 	});
 
 	// 2. Build additive pool for remaining taps (8..15)
-	// Add octaves if toggled
 	if (octavesActive > 0, {
 		specialPool.addAll([2.0, 1.0, 2.0]);
 	});
-	// Add 5ths and 4ths if toggled
 	if (fifthsActive > 0, {
 		specialPool.addAll([1.5, 4/3, 9/8]);
 	});
-	// Add sub-octaves if toggled
 	if (suboctavesActive > 0, {
 		specialPool.addAll([0.25, 0.5, 0.5]);
 	});
@@ -115,7 +119,7 @@ updateAllTapRates = {
 		g.set(\rate, tapAssignments[idx] * rateMult);
 	});
 
-	("  -> Tap Rates Updated (Simultaneous Forward & Reverse: " ++ (reverseActive > 0) ++ " | Octaves: " ++ (octavesActive > 0) ++ " | 5ths: " ++ (fifthsActive > 0) ++ " | Sub: " ++ (suboctavesActive > 0) ++ ")").postln;
+	(" -> Tap Rates Updated (Simultaneous Forward & Reverse: " ++ (reverseActive > 0) ++ " | Octaves: " ++ (octavesActive > 0) ++ " | 5ths: " ++ (fifthsActive > 0) ++ " | Sub: " ++ (suboctavesActive > 0) ++ ")").postln;
 };
 
 // Unified Handler Functions
@@ -128,37 +132,41 @@ handleCC = { |chan, num, val|
 		{ num == 1 } {
 			passLevel = (val / 127).round(0.001);
 			micPassSynth.set(\amp, passLevel * passMute);
-			("  -> Passthrough Level: " ++ (passLevel * 100).round(0.1) ++ "%").postln;
+			(" -> Passthrough Level: " ++ (passLevel * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 2 } {
 			delayInLevel = (val / 127).round(0.001);
 			micSynth.set(\amp, delayInLevel * delayInMute * (1 - freezeActive));
-			("  -> Delay Input Level: " ++ (delayInLevel * 100).round(0.1) ++ "%").postln;
+			(" -> Delay Input Level: " ++ (delayInLevel * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 3 } {
 			var pre = (val / 127).round(0.001);
 			recSynth.set(\preLevel, if(freezeActive > 0, 1.0, pre));
-			("  -> Preserve Level: " ++ (pre * 100).round(0.1) ++ "%").postln;
+			(" -> Preserve Level: " ++ (pre * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 4 } {
 			passMute = if(val > 0, 1, 0);
 			micPassSynth.set(\amp, passLevel * passMute);
-			("  -> Passthrough Mute: " ++ passMute).postln;
+			(" -> Passthrough Mute: " ++ passMute).postln;
 		}
 		{ num == 5 } {
 			delayInMute = if(val > 0, 1, 0);
 			micSynth.set(\amp, delayInLevel * delayInMute * (1 - freezeActive));
-			("  -> Delay Input Mute: " ++ delayInMute).postln;
+			(" -> Delay Input Mute: " ++ delayInMute).postln;
 		}
 		{ num == 6 } {
 			delayOutMute = if(val > 0, 1, 0);
-			granSynths.do({ |g| g.set(\amp, 0.8 * delayOutMute) });
-			("  -> Delay Output Master Mute: " ++ delayOutMute).postln;
+			// Restore per-tap ampLFOs when unmuting; zero when muting
+			granSynths.do({ |g, idx|
+				g.set(\amp, if(delayOutMute > 0, ampLFOs[idx], 0));
+			});
+			(" -> Delay Output Master Mute: " ++ delayOutMute).postln;
 		}
 		{ num == 7 } {
+			// Master volume scales the combined output before the Limiter
 			masterVol = (val / 51).round(0.01);
 			masterOutSynth.set(\amp, masterVol);
-			("  -> Master Output Volume: " ++ masterVol ++ "x").postln;
+			(" -> Master Output Volume: " ++ masterVol ++ "x").postln;
 		};
 	});
 
@@ -167,33 +175,33 @@ handleCC = { |chan, num, val|
 		{ num == 1 } {
 			var amp = (val / 127).round(0.001);
 			fbSynth.set(\amp, amp);
-			("  -> Feedback Level: " ++ (amp * 100).round(0.1) ++ "%").postln;
+			(" -> Feedback Level: " ++ (amp * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 2 } {
 			var bal = val.linlin(0, 127, -1.0, 1.0).round(0.01);
 			fbSynth.set(\balance, bal);
-			("  -> Feedback Balance: " ++ bal).postln;
+			(" -> Feedback Balance: " ++ bal).postln;
 		}
 		{ num == 3 } {
 			var hp = val.linlin(0, 127, 0.0, 220.0).round(0.1);
 			fbSynth.set(\hpFreq, hp);
-			("  -> Feedback HPF: " ++ hp ++ " Hz").postln;
+			(" -> Feedback HPF: " ++ hp ++ " Hz").postln;
 		}
 		{ num == 4 } {
 			var nAmp = (val / 127).round(0.001);
 			fbSynth.set(\noiseLevel, nAmp);
-			("  -> Pink Noise Level: " ++ (nAmp * 100).round(0.1) ++ "%").postln;
+			(" -> Pink Noise Level: " ++ (nAmp * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 5 } {
 			var sAmp = (val / 127).round(0.001);
 			fbSynth.set(\sineLevel, sAmp);
-			("  -> Sine Oscillator Level: " ++ (sAmp * 100).round(0.1) ++ "%").postln;
+			(" -> Sine Oscillator Level: " ++ (sAmp * 100).round(0.1) ++ "%").postln;
 		}
 		{ num == 6 } {
 			var note = val.linlin(0, 127, 20, 90).round;
 			var hz = note.midicps.round(0.1);
 			fbSynth.set(\sineHz, hz);
-			("  -> Sine Oscillator Frequency: " ++ hz ++ " Hz (Note " ++ note ++ ")").postln;
+			(" -> Sine Oscillator Frequency: " ++ hz ++ " Hz (Note " ++ note ++ ")").postln;
 		};
 	});
 
@@ -202,7 +210,7 @@ handleCC = { |chan, num, val|
 		{ num == 1 } {
 			rateMult = val.linlin(0, 127, 0.25, 2.0).round(0.01);
 			updateAllTapRates.();
-			("  -> Playback Rate Multiplier: " ++ rateMult ++ "x").postln;
+			(" -> Playback Rate Multiplier: " ++ rateMult ++ "x").postln;
 		}
 		{ num == 2 } {
 			var densMult = val.linlin(0, 127, 0.2, 3.0).round(0.01);
@@ -210,12 +218,12 @@ handleCC = { |chan, num, val|
 				var baseDens = 1 / (durs[idx] * baseCarterRates[idx % baseCarterRates.size]);
 				g.set(\dens, (baseDens * densMult).abs);
 			});
-			("  -> Grain Density Multiplier: " ++ densMult ++ "x").postln;
+			(" -> Grain Density Multiplier: " ++ densMult ++ "x").postln;
 		}
 		{ num == 3 } {
 			var cut = val.linexp(0, 127, 200, 16000).round(1);
 			granSynths.do({ |g| g.set(\cutoff, cut) });
-			("  -> Low-Pass Filter Cutoff: " ++ cut ++ " Hz").postln;
+			(" -> Low-Pass Filter Cutoff: " ++ cut ++ " Hz").postln;
 		}
 		{ num == 4 } {
 			var jitterSecs = (val / 127) * 2.5;
@@ -223,18 +231,18 @@ handleCC = { |chan, num, val|
 			granSynths.do({ |g, idx|
 				g.set(\ptrRandSamples, jitterSamples);
 			});
-			("  -> Position Jitter / Spread: " ++ jitterSecs.round(0.01) ++ " sec").postln;
+			(" -> Position Jitter / Spread: " ++ jitterSecs.round(0.01) ++ " sec").postln;
 		}
 		{ num == 5 } {
 			var syncVal = (val / 127).round(0.01);
 			granSynths.do({ |g| g.set(\sync, syncVal) });
-			("  -> Trigger Distribution: " ++ (syncVal * 100).round(1) ++ "%").postln;
+			(" -> Trigger Distribution: " ++ (syncVal * 100).round(1) ++ "%").postln;
 		}
 		{ num == 6 } {
 			var envIdx = (val / 43).floor.clip(0, 2).asInteger;
 			var targetBuf = if(envIdx == 0, -1, envBufs[envIdx - 1].bufnum);
 			granSynths.do({ |g| g.set(\grainEnv, targetBuf) });
-			("  -> Grain Window Function: " ++ ["Hanning Bell Window", "Percussive Decaying Window", "Reverse Attack Swell Window"][envIdx]).postln;
+			(" -> Grain Window Function: " ++ ["Hanning Bell Window", "Percussive Decaying Window", "Reverse Attack Swell Window"][envIdx]).postln;
 		}
 		{ num == 8 } {
 			freezeActive = if(val > 0, 1, 0);
@@ -242,12 +250,12 @@ handleCC = { |chan, num, val|
 				ptrSynth.set(\rate, 0);
 				recSynth.set(\preLevel, 1.0);
 				micSynth.set(\amp, 0);
-				("  -> [RECORD FREEZE ACTIVE] Audio buffer locked in memory.").postln;
+				(" -> [RECORD FREEZE ACTIVE] Audio buffer locked in memory.").postln;
 			}, {
 				ptrSynth.set(\rate, 1);
 				recSynth.set(\preLevel, 0.5);
 				micSynth.set(\amp, delayInLevel * delayInMute);
-				("  -> [RECORD FREEZE INACTIVE] Live recording active.").postln;
+				(" -> [RECORD FREEZE INACTIVE] Live recording active.").postln;
 			});
 		}
 		{ num == 9 } {
@@ -278,17 +286,20 @@ handleNote = { |chan, num, val|
 		{ num == 60 } {
 			passMute = 1 - passMute;
 			micPassSynth.set(\amp, passLevel * passMute);
-			("  -> Passthrough Mute: " ++ passMute).postln;
+			(" -> Passthrough Mute: " ++ passMute).postln;
 		}
 		{ num == 61 } {
 			delayInMute = 1 - delayInMute;
 			micSynth.set(\amp, delayInLevel * delayInMute * (1 - freezeActive));
-			("  -> Delay Input Mute: " ++ delayInMute).postln;
+			(" -> Delay Input Mute: " ++ delayInMute).postln;
 		}
 		{ num == 62 } {
 			delayOutMute = 1 - delayOutMute;
-			granSynths.do({ |g| g.set(\amp, 0.8 * delayOutMute) });
-			("  -> Delay Output Master Mute: " ++ delayOutMute).postln;
+			// Restore per-tap ampLFOs when unmuting; zero when muting
+			granSynths.do({ |g, idx|
+				g.set(\amp, if(delayOutMute > 0, ampLFOs[idx], 0));
+			});
+			(" -> Delay Output Master Mute: " ++ delayOutMute).postln;
 		}
 		{ num == 63 } {
 			freezeActive = 1 - freezeActive;
@@ -296,12 +307,12 @@ handleNote = { |chan, num, val|
 				ptrSynth.set(\rate, 0);
 				recSynth.set(\preLevel, 1.0);
 				micSynth.set(\amp, 0);
-				("  -> [RECORD FREEZE TOGGLED ACTIVE] Audio buffer locked.").postln;
+				(" -> [RECORD FREEZE TOGGLED ACTIVE] Audio buffer locked.").postln;
 			}, {
 				ptrSynth.set(\rate, 1);
 				recSynth.set(\preLevel, 0.5);
 				micSynth.set(\amp, delayInLevel * delayInMute);
-				("  -> [RECORD FREEZE TOGGLED INACTIVE] Live recording active.").postln;
+				(" -> [RECORD FREEZE TOGGLED INACTIVE] Live recording active.").postln;
 			});
 		};
 	});
@@ -341,10 +352,15 @@ s.waitForBoot({
 			Out.ar(out, sig!2);
 		}).add;
 
+		// Master Output with Limiter (replaces softclip for transparent peak control)
+		// masterVol (CC 7) scales the signal BEFORE the Limiter.
+		// At masterVol 1.0x, signal passes cleanly through.
+		// Push masterVol above 1.0x to drive harder into the Limiter for more perceived loudness.
+		// Limiter catches peaks at 0dBFS — no clipping, no headroom eaten by softclip compression.
 		SynthDef(\masterOutput, {
 			arg in = 0, out = 0, amp = 1.0;
 			var sig = In.ar(in, 2);
-			sig = (sig * amp).softclip;
+			sig = Limiter.ar(sig * amp, 1.0, 0.01);
 			Out.ar(out, sig);
 		}).add;
 
@@ -437,17 +453,43 @@ s.waitForBoot({
 		fbSynth      = Synth(\fbPatchMix, [\in, 0, \out, micBus, \amp, 0.0], micGrp, \addToHead);
 		masterOutSynth = Synth(\masterOutput, [\in, granBus, \out, 0, \amp, masterVol], outGrp);
 
-		panLFOs = Array.fill(16, { |i| Ndef((\pan ++ i).asSymbol, { LFTri.kr(timer.beatDur / rrand(1, 64)).range(-1, 1) }) });
-		cutoffLFOs = Array.fill(16, { |i| Ndef((\cut ++ i).asSymbol, { LFTri.kr(timer.beatDur / rrand(1, 64)).range(500, 15000) }) });
-		resonanceLFOs = Array.fill(16, { |i| Ndef((\res ++ i).asSymbol, { LFTri.kr(timer.beatDur / rrand(1, 64)).range(0, 2) }) });
+		// LFNoise1 LFOs — low-frequency noise for naturalistic, non-repetitive modulation
+		// (replaces LFTri for organic motion as in the original Carter's Delay spirit)
+		panLFOs = Array.fill(16, { |i|
+			Ndef((\pan ++ i).asSymbol, {
+				LFNoise1.kr(timer.beatDur / rrand(1, 64)).range(-1, 1)
+			})
+		});
+
+		// Per-tap amplitude LFOs — range 1..3 matches original SeamstressCarter (~ampLFOs)
+		// These give each tap organic fade in/out character.
+		// masterVol (CC 7) controls the overall mix level independently.
+		ampLFOs = Array.fill(16, { |i|
+			Ndef((\amp ++ i).asSymbol, {
+				LFNoise1.kr(timer.beatDur / rrand(1, 64)).range(1, 3)
+			})
+		});
+
+		cutoffLFOs = Array.fill(16, { |i|
+			Ndef((\cut ++ i).asSymbol, {
+				LFNoise1.kr(timer.beatDur / rrand(1, 64)).range(500, 15000)
+			})
+		});
+
+		resonanceLFOs = Array.fill(16, { |i|
+			Ndef((\res ++ i).asSymbol, {
+				LFNoise1.kr(timer.beatDur / rrand(1, 64)).range(0, 2)
+			})
+		});
 
 		rates  = baseCarterRates;
 		durs   = 16.collect({ |i| timer.beatDur * (i + 1) }).scramble;
 		delays = 16.collect({ |i| s.sampleRate * (timer.beatDur * (i + 1)) * 16 }).scramble;
 
+		// Initialize 16 granular taps with per-tap ampLFOs (organic amplitude modulation)
 		granSynths = 16.collect({ |n|
 			Synth(\gran, [
-				\amp, 0.8 * delayOutMute,
+				\amp, if(delayOutMute > 0, ampLFOs[n], 0),
 				\buf, b,
 				\out, granBus,
 				\atk, 1, \rel, 1, \gate, 1, \sync, 1.0,
