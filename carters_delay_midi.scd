@@ -75,7 +75,7 @@ updateAllTapRates = {
 	var tapAssignments = Array.newClear(16);
 	var specialPool = List.new;
 
-	// 1. Fill base Carter forward taps (Taps 0..7 always preserve core Carter forward delays)
+	// 1. Fill base taps (Taps 0..7 always preserve core delays)
 	8.do({ |i|
 		tapAssignments[i] = baseCarterRates[i % baseCarterRates.size];
 	});
@@ -101,8 +101,8 @@ updateAllTapRates = {
 		tapAssignments[i] = specialPool[poolIdx % specialPool.size];
 	});
 
-	// 3. When Reverse is active, interleave reverse playback into taps (e.g. odd taps reverse, even taps forward)
-	// This ensures BOTH forward and reverse taps play simultaneously!
+	// 3. When Reverse is active, interleave reverse playback into taps
+	// This ensures BOTH forward and reverse taps play simultaneously
 	if (reverseActive > 0, {
 		[1, 3, 5, 7, 9, 11, 13, 15].do({ |idx|
 			tapAssignments[idx] = tapAssignments[idx].abs * -1.0;
@@ -355,8 +355,8 @@ s.waitForBoot({
 		// Master Output with Limiter (replaces softclip for transparent peak control)
 		// masterVol (CC 7) scales the signal BEFORE the Limiter.
 		// At masterVol 1.0x, signal passes cleanly through.
-		// Push masterVol above 1.0x to drive harder into the Limiter for more perceived loudness.
-		// Limiter catches peaks at 0dBFS — no clipping, no headroom eaten by softclip compression.
+		// Push masterVol above 1.0x for more perceived loudness.
+		// Limiter catches peaks at 0dBFS — no clipping
 		SynthDef(\masterOutput, {
 			arg in = 0, out = 0, amp = 1.0;
 			var sig = In.ar(in, 2);
@@ -453,16 +453,14 @@ s.waitForBoot({
 		fbSynth      = Synth(\fbPatchMix, [\in, 0, \out, micBus, \amp, 0.0], micGrp, \addToHead);
 		masterOutSynth = Synth(\masterOutput, [\in, granBus, \out, 0, \amp, masterVol], outGrp);
 
-		// LFNoise1 LFOs — low-frequency noise for naturalistic, non-repetitive modulation
-		// (replaces LFTri for organic motion as in the original Carter's Delay spirit)
+		// LFNoise1 LFOs — low-frequency noise
 		panLFOs = Array.fill(16, { |i|
 			Ndef((\pan ++ i).asSymbol, {
 				LFNoise1.kr(timer.beatDur / rrand(1, 64)).range(-1, 1)
 			})
 		});
 
-		// Per-tap amplitude LFOs — range 1..3 matches original SeamstressCarter (~ampLFOs)
-		// These give each tap organic fade in/out character.
+		// Per-tap amplitude LFOs — range 1..3
 		// masterVol (CC 7) controls the overall mix level independently.
 		ampLFOs = Array.fill(16, { |i|
 			Ndef((\amp ++ i).asSymbol, {
@@ -486,7 +484,7 @@ s.waitForBoot({
 		durs   = 16.collect({ |i| timer.beatDur * (i + 1) }).scramble;
 		delays = 16.collect({ |i| s.sampleRate * (timer.beatDur * (i + 1)) * 16 }).scramble;
 
-		// Initialize 16 granular taps with per-tap ampLFOs (organic amplitude modulation)
+		// Initialize 16 granular taps with per-tap ampLFOs
 		granSynths = 16.collect({ |n|
 			Synth(\gran, [
 				\amp, if(delayOutMute > 0, ampLFOs[n], 0),
