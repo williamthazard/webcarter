@@ -505,7 +505,9 @@ no second port to wire up.
    those controls by hand — so the UI, the log, and local storage all agree,
    and a later Send all values won't un-mute anything behind your back.
 7. **Double-click** any slider to reset it to its factory default and send
-   that value immediately.
+   that value immediately. **Reset to defaults** does the same for every
+   control at once, using the same values the engine boots into — handy when
+   old settings restored from local storage don't match what you want.
 8. Every control shows the exact MIDI bytes it will send, right next to it,
    even before you touch it — the byte readout flashes when a message
    actually goes out. The MIDI monitor below shows the same bytes as a

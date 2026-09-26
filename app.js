@@ -132,6 +132,7 @@
   const scopeSpanLabelEl = document.getElementById("scopeSpanLabel");
   const btnPanic = document.getElementById("btnPanic");
   const btnSendAll = document.getElementById("btnSendAll");
+  const btnReset = document.getElementById("btnReset");
   const btnClearLog = document.getElementById("btnClearLog");
   const logContainer = document.getElementById("logContainer");
   const scopeCanvas = document.getElementById("scopeCanvas");
@@ -965,6 +966,12 @@
       setControlValue(CONTROLS_BY_KEY.delayInLevel, 0);
       setControlValue(CONTROLS_BY_KEY.delayOutOn, false);
       setControlValue(CONTROLS_BY_KEY.fbLevel, 0);
+    });
+
+    // Same defaults the engine boots into (defaultCCs), sent and saved.
+    btnReset.addEventListener("click", () => {
+      log("Resetting every control to its default…", "system");
+      CONTROLS.forEach((c) => setControlValue(c, c.kind === "slider" ? c.def : c.def > 0));
     });
 
     restoreControlsFromState();
