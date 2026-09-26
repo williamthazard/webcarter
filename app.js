@@ -1,31 +1,134 @@
 /**
- * Carter's Delay — WebMIDI Demo Application Logic (Additive Toggles & Interleaved Forward/Reverse)
+ * Carter's Delay — WebMIDI Demo Application Logic
+ *
+ * This is a reference WebMIDI frontend for carters_delay_midi.scd. It is a
+ * CC-only control contract (MAP and CONTROLS below mirror the engine's MIDI
+ * contract exactly — see README.md / the .scd header) plus a bidirectional
+ * layer (BIDI_SPEC): the engine echoes every control it applies on channels
+ * 9-11, replies to a state request on Ch 16 CC 1, and streams scope
+ * telemetry over SysEx (F0 7D 43 ...). The buffer scope below is drawn
+ * purely from that telemetry — there is no local audio simulation.
  */
 
 (function () {
+  // ---------------------------------------------------------------------
+  // MAP: mapping functions that mirror the SC engine's helpers exactly.
+  // ---------------------------------------------------------------------
+  function ccToMult(v, lo, hi) {
+    // Same shape as the engine's ccToMult helper: two-segment exponential,
+    // exactly 1.0 at v = 64, exact endpoints at v = 0 (lo) and v = 127 (hi).
+    return v <= 64 ? lo * Math.pow(1 / lo, v / 64) : Math.pow(hi, (v - 64) / 63);
+  }
+
+  const MAP = {
+    level: (v) => v / 127,
+    master: (v) => v / 51,
+    bipolar: (v) => (v <= 64 ? (v - 64) / 64 : (v - 64) / 63),
+    hpfHz: (v) => (v / 127) * 220,
+    sineNote: (v) => Math.round(20 + (v * 70) / 127),
+    sineHz: (v) => 440 * Math.pow(2, (MAP.sineNote(v) - 69) / 12),
+    rate: (v) => ccToMult(v, 0.25, 2),
+    density: (v) => ccToMult(v, 0.2, 3),
+    cutoffHz: (v) => 200 * Math.pow(80, v / 127),
+    jitterSec: (v) => (v / 127) * 2.5,
+    syncFraction: (v) => v / 127,
+    windowIndex: (v) => (v < 43 ? 0 : v < 86 ? 1 : 2),
+  };
+
+  const WINDOW_NAMES = ["Hann", "Percussive", "Reverse Swell"];
+
+  // ---------------------------------------------------------------------
+  // Display formats
+  // ---------------------------------------------------------------------
+  const fmtPercent = (v) => `${Math.round(MAP.level(v) * 100)}%`;
+  const fmtMaster = (v) => `${MAP.master(v).toFixed(2)}×`;
+  const fmtBalance = (v) => {
+    const b = MAP.bipolar(v);
+    if (b === 0) return "Center";
+    const pct = Math.round(Math.abs(b) * 100);
+    return b < 0 ? `L ${pct}%` : `R ${pct}%`;
+  };
+  const fmtHpf = (v) => `${MAP.hpfHz(v).toFixed(1)} Hz`;
+  const fmtSine = (v) => `${MAP.sineHz(v).toFixed(1)} Hz`;
+  const fmtRate = (v) => `${MAP.rate(v).toFixed(2)}×`;
+  const fmtDensity = (v) => `${MAP.density(v).toFixed(2)}×`;
+  const fmtCutoff = (v) => `${Math.round(MAP.cutoffHz(v))} Hz${v === 127 ? " (no cap)" : ""}`;
+  const fmtJitter = (v) => `${MAP.jitterSec(v).toFixed(2)} s`;
+  const fmtSync = (v) => (v === 127 ? "Periodic" : v === 0 ? "Random" : `${Math.round(MAP.syncFraction(v) * 100)}% periodic`);
+  const fmtWindow = (v) => WINDOW_NAMES[MAP.windowIndex(v)];
+  const fmtOnOff = (onLabel, offLabel) => (v) => (v > 0 ? onLabel : offLabel);
+
+  // ---------------------------------------------------------------------
+  // CONTROLS: one entry per MIDI control. Order matches the engine's
+  // defaultCCs table exactly, so Send All / boot-time defaults agree.
+  //
+  // kind: "slider" (range input), "toggle" (two-segment on/off control,
+  // e.g. [On|Muted]), or "chip" (pressable pitch-interval chip).
+  // ---------------------------------------------------------------------
+  const CONTROLS = [
+    // Channel 1 — levels & routing
+    { key: "masterVol", id: "ctl_masterVol", ch: 1, cc: 7, label: "Master output level", def: 51, kind: "slider", format: fmtMaster },
+    { key: "passLevel", id: "ctl_passLevel", ch: 1, cc: 1, label: "Input passthrough level", def: 64, kind: "slider", format: fmtPercent },
+    { key: "delayInLevel", id: "ctl_delayInLevel", ch: 1, cc: 2, label: "Delay input level", def: 64, kind: "slider", format: fmtPercent },
+    { key: "preserveLevel", id: "ctl_preserveLevel", ch: 1, cc: 3, label: "Buffer preservation", def: 64, kind: "slider", format: fmtPercent },
+    { key: "passOn", id: "ctl_passOn", ch: 1, cc: 4, label: "Input passthrough on", def: 127, kind: "toggle", format: fmtOnOff("On", "Muted") },
+    { key: "delayInOn", id: "ctl_delayInOn", ch: 1, cc: 5, label: "Delay input on", def: 127, kind: "toggle", format: fmtOnOff("On", "Muted") },
+    { key: "delayOutOn", id: "ctl_delayOutOn", ch: 1, cc: 6, label: "Delay output on", def: 127, kind: "toggle", format: fmtOnOff("On", "Muted") },
+
+    // Channel 2 — feedback patch
+    { key: "fbLevel", id: "ctl_fbLevel", ch: 2, cc: 1, label: "Feedback level", def: 0, kind: "slider", format: fmtPercent },
+    { key: "fbBalance", id: "ctl_fbBalance", ch: 2, cc: 2, label: "Feedback balance", def: 64, kind: "slider", format: fmtBalance },
+    { key: "fbHp", id: "ctl_fbHp", ch: 2, cc: 3, label: "Feedback high-pass", def: 7, kind: "slider", format: fmtHpf },
+    { key: "fbNoise", id: "ctl_fbNoise", ch: 2, cc: 4, label: "Pink noise level", def: 0, kind: "slider", format: fmtPercent },
+    { key: "fbSineLevel", id: "ctl_fbSineLevel", ch: 2, cc: 5, label: "Sine level", def: 0, kind: "slider", format: fmtPercent },
+    { key: "fbSinePitch", id: "ctl_fbSinePitch", ch: 2, cc: 6, label: "Sine frequency", def: 24, kind: "slider", format: fmtSine },
+
+    // Channel 3 — granular engine
+    { key: "rateMult", id: "ctl_rateMult", ch: 3, cc: 1, label: "Playback rate", def: 64, kind: "slider", format: fmtRate },
+    { key: "densMult", id: "ctl_densMult", ch: 3, cc: 2, label: "Grain density", def: 64, kind: "slider", format: fmtDensity },
+    { key: "cutoffMax", id: "ctl_cutoffMax", ch: 3, cc: 3, label: "Low-pass cutoff ceiling", def: 127, kind: "slider", format: fmtCutoff },
+    { key: "jitter", id: "ctl_jitter", ch: 3, cc: 4, label: "Position jitter", def: 0, kind: "slider", format: fmtJitter },
+    { key: "sync", id: "ctl_sync", ch: 3, cc: 5, label: "Trigger distribution", def: 127, kind: "slider", format: fmtSync },
+    { key: "window", id: "ctl_window", ch: 3, cc: 6, label: "Grain window", def: 0, kind: "slider", format: fmtWindow },
+    { key: "freezeOn", id: "ctl_freezeOn", ch: 3, cc: 8, label: "Buffer freeze", def: 0, kind: "toggle", format: fmtOnOff("Frozen", "Live") },
+    { key: "octavesOn", id: "ctl_octavesOn", ch: 3, cc: 9, label: "Octaves", def: 0, kind: "chip", format: fmtOnOff("on", "off") },
+    { key: "fifthsOn", id: "ctl_fifthsOn", ch: 3, cc: 10, label: "Fifths & fourths", def: 0, kind: "chip", format: fmtOnOff("on", "off") },
+    { key: "suboctavesOn", id: "ctl_suboctavesOn", ch: 3, cc: 11, label: "Sub-octaves", def: 0, kind: "chip", format: fmtOnOff("on", "off") },
+    { key: "reverseOn", id: "ctl_reverseOn", ch: 3, cc: 12, label: "Reverse", def: 0, kind: "chip", format: fmtOnOff("on", "off") },
+  ];
+
+  const CONTROLS_BY_KEY = {};
+  CONTROLS.forEach((c) => { CONTROLS_BY_KEY[c.key] = c; });
+
+  // Echo lookup: BIDI_SPEC §2 — "Find the CONTROLS entry by (echo channel −
+  // 8, cc)." Keyed by the control's own (1-based) channel and CC.
+  const CONTROLS_BY_CHCC = {};
+  CONTROLS.forEach((c) => { CONTROLS_BY_CHCC[c.ch + ":" + c.cc] = c; });
+
+  const INTERVAL_KEYS = ["octavesOn", "fifthsOn", "suboctavesOn", "reverseOn"];
+
+  // State: one field per CONTROLS entry, seeded from CONTROLS' own defaults
+  // (which are the single source of truth, matching the engine's defaultCCs).
+  const state = {};
+  CONTROLS.forEach((c) => {
+    state[c.key] = c.kind === "slider" ? c.def : c.def > 0;
+  });
+
   // State
   let midiAccess = null;
   let midiOutput = null;
-  let channelMode = "multi"; // "multi" or "ch1"
-  let webAudioActive = false;
-  let audioEngine = null;
-
-  // Microphone Audio State
-  let micActive = false;
-  let micStream = null;
-  let micAudioCtx = null;
-  let micAnalyser = null;
-  let micDataArray = null;
+  let midiInput = null;
+  let sysexGranted = true; // optimistic until a fallback proves otherwise
 
   // DOM Elements
   const statusDotEl = document.getElementById("statusDot");
   const statusTextEl = document.getElementById("statusText");
   const midiOutputSelect = document.getElementById("midiOutputSelect");
-  const midiChannelModeSelect = document.getElementById("midiChannelMode");
-  const btnMicInput = document.getElementById("btnMicInput");
-  const micStateEl = document.getElementById("micState");
-  const btnWebAudio = document.getElementById("btnWebAudio");
-  const webAudioStateEl = document.getElementById("webAudioState");
+  const midiInputSelect = document.getElementById("midiInputSelect");
+  const engineDotEl = document.getElementById("engineDot");
+  const engineStatusTextEl = document.getElementById("engineStatusText");
+  const telemetryLineEl = document.getElementById("telemetryLine");
+  const scopeSpanLabelEl = document.getElementById("scopeSpanLabel");
   const btnPanic = document.getElementById("btnPanic");
   const btnSendAll = document.getElementById("btnSendAll");
   const btnClearLog = document.getElementById("btnClearLog");
@@ -33,144 +136,72 @@
   const scopeCanvas = document.getElementById("scopeCanvas");
   const ctx = scopeCanvas.getContext("2d");
 
-  // Interval Toggle State (Independent Additive Mix & Match)
-  const intervalToggles = {
-    octaves: false,    // CC 9 [2:1]
-    fifths: false,     // CC 10 [3:2, 4:3]
-    suboctaves: false, // CC 11 [1:2, 1:4]
-    reverse: false     // CC 12 [Interleaves reverse taps]
-  };
+  const LOG_MAX_ENTRIES = 300;
 
-  const baseCarterRatios = [0.25, 0.5, 1.0, 1.5, 2.0];
-
-  // Computes the active rates for all 16 taps additively
-  function get16TapRates() {
-    const tapRates = new Array(16);
-    const specialPool = [];
-
-    // Taps 0..7 always preserve core forward Carter ratios
-    for (let i = 0; i < 8; i++) {
-      tapRates[i] = baseCarterRatios[i % baseCarterRatios.length];
-    }
-
-    // Add extra intervals to pool
-    if (intervalToggles.octaves) specialPool.push(2.0, 1.0, 2.0);
-    if (intervalToggles.fifths) specialPool.push(1.5, 1.333, 1.125);
-    if (intervalToggles.suboctaves) specialPool.push(0.25, 0.5, 0.5);
-
-    if (specialPool.length === 0) {
-      specialPool.push(...baseCarterRatios);
-    }
-
-    // Assign taps 8..15 from additive interval pool
-    for (let i = 8; i < 16; i++) {
-      tapRates[i] = specialPool[(i - 8) % specialPool.length];
-    }
-
-    // When reverse is active, interleave odd taps to reverse (-1.0)
-    // while even taps continue playing FORWARD! Both play simultaneously.
-    if (intervalToggles.reverse) {
-      [1, 3, 5, 7, 9, 11, 13, 15].forEach(idx => {
-        tapRates[idx] = -Math.abs(tapRates[idx]);
-      });
-    } else {
-      for (let i = 0; i < 16; i++) {
-        tapRates[i] = Math.abs(tapRates[i]);
-      }
-    }
-
-    return tapRates;
-  }
-
-  // Envelope Window Functions
-  const envWindows = ["Hanning (Default)", "Percussive Saw", "Reverse Swell"];
-
-  // Control State Object (Defaults matching Carter's Delay)
-  const state = {
-    masterVol: 51,     // Ch 1 CC 7 (51 = 1.0x Unity Gain)
-    passLevel: 64,     // Ch 1 CC 1 (50%)
-    passMute: true,    // Ch 1 CC 4 / Note 60
-    delayInLevel: 64,  // Ch 1 CC 2 (50%)
-    delayInMute: true, // Ch 1 CC 5 / Note 61
-    preserveLevel: 64, // Ch 1 CC 3 (50%)
-    delayOutMute: true,// Ch 1 CC 6 / Note 62
-    
-    fbLevel: 0,        // Ch 2 CC 1 (0%)
-    fbBalance: 64,     // Ch 2 CC 2 (Center)
-    fbHp: 12,          // Ch 2 CC 3 (12 Hz)
-    fbNoise: 0,        // Ch 2 CC 4 (0%)
-    fbSineLevel: 0,    // Ch 2 CC 5 (0%)
-    fbSinePitch: 30,   // Ch 2 CC 6 (55Hz / A1)
-
-    grainRate: 64,     // Ch 3 CC 1 (1.0x)
-    grainDens: 64,     // Ch 3 CC 2 (1.0x)
-    cutoff: 100,       // Ch 3 CC 3 (12000Hz)
-    jumble: 0,         // Ch 3 CC 4 (0.00s Default)
-    syncMode: 127,     // Ch 3 CC 5 (127 = Periodic Impulse Default)
-    envShape: 0,       // Ch 3 CC 6 (0 = Hanning Default)
-    freeze: false      // Ch 3 CC 8 / Note 63 (False Default)
-  };
-
+  // ---------------------------------------------------------------------
   // Persistence: Save/Restore All Settings via localStorage
-  const SETTINGS_STORAGE_KEY = "cartersDelay.settings.v1";
+  // ---------------------------------------------------------------------
+  const SETTINGS_STORAGE_KEY = "cartersDelay.settings.v2"; // bumped; the old v1 key is ignored
 
-  function loadSavedSettings() {
+  function readSettingsRaw() {
     try {
       const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
       return raw ? JSON.parse(raw) : null;
     } catch (e) {
-      console.warn("Could not load saved settings:", e);
+      console.warn("Could not read saved settings:", e);
       return null;
     }
   }
 
+  function applySavedState(saved) {
+    if (!saved || typeof saved !== "object" || !saved.state || typeof saved.state !== "object") return;
+    const savedState = saved.state;
+    CONTROLS.forEach((c) => {
+      if (!(c.key in savedState)) return; // unknown/missing keys are ignored
+      const raw = savedState[c.key];
+      if (c.kind === "slider") {
+        let n = Number(raw);
+        if (!Number.isFinite(n)) return;
+        n = Math.max(0, Math.min(127, Math.round(n))); // clamped to integers 0..127
+        state[c.key] = n;
+      } else {
+        state[c.key] = Boolean(raw); // booleans are coerced
+      }
+    });
+  }
+
   function saveSettings() {
     try {
+      const savedState = {};
+      CONTROLS.forEach((c) => { savedState[c.key] = state[c.key]; });
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
-        state,
-        intervalToggles,
-        channelMode,
-        midiOutputName: midiOutput ? midiOutput.name : null
+        state: savedState,
+        midiOutputName: midiOutput ? midiOutput.name : null,
+        midiInputName: midiInput ? midiInput.name : null,
       }));
     } catch (e) {
       console.warn("Could not save settings:", e);
     }
   }
 
-  const savedSettings = loadSavedSettings();
-  if (savedSettings) {
-    if (savedSettings.state) Object.assign(state, savedSettings.state);
-    if (savedSettings.intervalToggles) Object.assign(intervalToggles, savedSettings.intervalToggles);
-    if (savedSettings.channelMode) channelMode = savedSettings.channelMode;
+  function getSavedOutputName() {
+    // Read fresh at call time (not a load-time const) so updateOutputs()
+    // always sees the latest saved preference, including one saved earlier
+    // in this same session.
+    const raw = readSettingsRaw();
+    return raw && typeof raw.midiOutputName === "string" ? raw.midiOutputName : null;
   }
 
-  // 512-Point Ring Buffer for Recording Audio Waveform
-  const bufferLength = 512;
-  const audioRingBuffer = new Float32Array(bufferLength);
-  let lastWriteIndex = 0;
+  function getSavedInputName() {
+    const raw = readSettingsRaw();
+    return raw && typeof raw.midiInputName === "string" ? raw.midiInputName : null;
+  }
 
-  // 16 Granular Delay Tap Slices with Variable LFO Speeds
-  const taps = Array.from({ length: 16 }, (_, i) => {
-    const rrandDiv = 1 + Math.random() * 63;
-    const lfoSpeed = 0.002 + (1 / rrandDiv) * 0.035;
-    return {
-      id: i,
-      delayOffset: 0.05 + (i * 0.055),
-      lfoSpeed: lfoSpeed,
-      playheadProgress: Math.random(),
-      panPhase: Math.random() * Math.PI * 2,
-      pan: 0,
-      // Per-tap amplitude LFO (LFNoise1-style linear interpolation)
-      // Simulates the SC ampLFOs that make taps organically fade in and out
-      ampLfo: 0.4 + Math.random() * 0.6,
-      ampLfoTarget: 0.4 + Math.random() * 0.6,
-      ampLfoRate: 0.002 + Math.random() * 0.012
-    };
-  });
+  applySavedState(readSettingsRaw());
 
-  let recPointer = 0;
-
-  // Canvas HiDPI Scaling setup (Strict Dimension Safeguards)
+  // ---------------------------------------------------------------------
+  // Canvas HiDPI Scaling setup
+  // ---------------------------------------------------------------------
   let canvasCssWidth = 900;
   let canvasCssHeight = 180;
 
@@ -181,7 +212,7 @@
     if (!targetWidth) return;
 
     canvasCssWidth = targetWidth;
-    canvasCssHeight = 180;
+    canvasCssHeight = rect.height > 50 ? rect.height : canvasCssHeight;
 
     const dpr = window.devicePixelRatio || 1;
     scopeCanvas.width = Math.floor(targetWidth * dpr);
@@ -195,26 +226,88 @@
     new ResizeObserver(() => setupCanvasScaling()).observe(scopeCanvas);
   }
 
-  // Direct native requestMIDIAccess
-  if (navigator.requestMIDIAccess) {
-    navigator.requestMIDIAccess({ sysex: false }).then(onMIDISuccess, onMIDIFailure);
-  } else {
-    log("navigator.requestMIDIAccess is not supported in this browser.", "alert");
-    statusDotEl.className = "indicator offline";
-    statusTextEl.textContent = "WebMIDI Unsupported";
+  // ---------------------------------------------------------------------
+  // Design tokens for the scope canvas — read from CSS custom properties
+  // rather than hardcoded hex, so the canvas always matches the theme.
+  // ---------------------------------------------------------------------
+  const theme = {
+    muted: "#a3a3a3",
+    text: "#ededed",
+    signal: "#ffffff",
+  };
+
+  function cssVar(name, fallback) {
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback;
+    } catch (e) {
+      return fallback;
+    }
   }
+
+  function refreshTheme() {
+    theme.muted = cssVar("--muted", theme.muted);
+    theme.text = cssVar("--text", theme.text);
+    theme.signal = cssVar("--signal", theme.signal);
+  }
+
+  function hexToRgb(hex) {
+    let h = String(hex).trim().replace("#", "");
+    if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+    const n = parseInt(h, 16) || 0;
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  }
+
+  function rgba(hex, alpha) {
+    const { r, g, b } = hexToRgb(hex);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  // ---------------------------------------------------------------------
+  // WebMIDI
+  // ---------------------------------------------------------------------
+  async function initMIDI() {
+    if (!navigator.requestMIDIAccess) {
+      log("navigator.requestMIDIAccess is not supported in this browser.", "alert");
+      statusDotEl.className = "indicator offline";
+      statusTextEl.textContent = "WebMIDI unsupported";
+      return;
+    }
+    try {
+      const access = await navigator.requestMIDIAccess({ sysex: true });
+      sysexGranted = typeof access.sysexEnabled === "boolean" ? access.sysexEnabled : true;
+      if (!sysexGranted) {
+        log("MIDI SysEx permission was not granted; controls still work, but the scope needs it.", "system");
+      }
+      onMIDISuccess(access);
+    } catch (errSysex) {
+      try {
+        const access = await navigator.requestMIDIAccess({ sysex: false });
+        sysexGranted = false;
+        log("MIDI SysEx permission denied; controls still work, but the scope needs it.", "system");
+        onMIDISuccess(access);
+      } catch (err) {
+        onMIDIFailure(err);
+      }
+    }
+  }
+  initMIDI();
 
   async function onMIDISuccess(access) {
     midiAccess = access;
-    log("WebMIDI Access granted.", "system");
+    log("WebMIDI access granted.", "system");
     await updateOutputs();
-    midiAccess.onstatechange = async () => await updateOutputs();
+    await updateInputs();
+    midiAccess.onstatechange = async () => {
+      await updateOutputs();
+      await updateInputs();
+    };
   }
 
   function onMIDIFailure(err) {
-    log("WebMIDI Access Failed: " + err, "alert");
+    log("WebMIDI access failed: " + err, "alert");
     statusDotEl.className = "indicator offline";
-    statusTextEl.textContent = "WebMIDI Denied";
+    statusTextEl.textContent = "WebMIDI denied";
   }
 
   async function updateOutputs() {
@@ -225,125 +318,240 @@
     if (outputs.length === 0) {
       const opt = document.createElement("option");
       opt.value = "";
-      opt.textContent = "No MIDI Devices Detected";
+      opt.textContent = "No MIDI devices detected";
       midiOutputSelect.appendChild(opt);
+      const hadOutput = !!midiOutput;
       midiOutput = null;
       statusDotEl.className = "indicator offline";
-      statusTextEl.textContent = "No Devices";
+      statusTextEl.textContent = "No devices";
+      if (hadOutput) log("Selected output: none (no devices connected)", "system");
       return;
     }
 
-    let defaultIndex = 0;
-    let matchedSavedDevice = false;
-    outputs.forEach((output, idx) => {
+    outputs.forEach((output) => {
       const opt = document.createElement("option");
       opt.value = output.id;
       opt.textContent = output.name;
       midiOutputSelect.appendChild(opt);
-
-      if (savedSettings && savedSettings.midiOutputName && output.name === savedSettings.midiOutputName) {
-        defaultIndex = idx;
-        matchedSavedDevice = true;
-      } else if (!matchedSavedDevice && (output.name.includes("IAC") || output.name.includes("Bus 1"))) {
-        defaultIndex = idx;
-      }
     });
 
-    midiOutputSelect.selectedIndex = defaultIndex;
-    midiOutput = outputs[defaultIndex];
+    // Keep the current selection if it still exists.
+    let chosen = midiOutput ? outputs.find((o) => o.id === midiOutput.id) || null : null;
 
-    try {
-      if (midiOutput.connection !== "open") {
-        await midiOutput.open();
-      }
-    } catch (e) {
-      console.warn("Could not open MIDI output:", e);
+    // Otherwise fall back, in order: saved name -> IAC/Bus 1/loopMIDI -> first output.
+    if (!chosen) {
+      const savedName = getSavedOutputName();
+      if (savedName) chosen = outputs.find((o) => o.name === savedName) || null;
     }
+    if (!chosen) {
+      chosen = outputs.find((o) => /IAC|Bus 1|loopMIDI/.test(o.name)) || null;
+    }
+    if (!chosen) {
+      chosen = outputs[0];
+    }
+
+    const changed = !midiOutput || midiOutput.id !== chosen.id;
+    midiOutputSelect.value = chosen.id;
+    midiOutput = chosen;
 
     statusDotEl.className = "indicator online";
     statusTextEl.textContent = "Connected: " + midiOutput.name;
-    log(`Selected Output: ${midiOutput.name} (${midiOutput.connection})`, "system");
-  }
 
-  midiOutputSelect.addEventListener("change", async (e) => {
-    if (midiAccess) {
-      midiOutput = midiAccess.outputs.get(e.target.value);
-    }
-    if (midiOutput) {
-      try {
-        if (midiOutput.connection !== "open") {
-          await midiOutput.open();
-        }
-      } catch (err) {
-        console.warn("Could not open MIDI output:", err);
-      }
-      statusDotEl.className = "indicator online";
-      statusTextEl.textContent = "Connected: " + midiOutput.name;
-      log(`Switched to Output: ${midiOutput.name} (${midiOutput.connection})`, "system");
+    if (changed) {
+      log(`Selected output: ${midiOutput.name}`, "system");
       saveSettings();
     }
-  });
-
-  midiChannelModeSelect.addEventListener("change", (e) => {
-    channelMode = e.target.value;
-    log("Channel Mode: " + e.target.options[e.target.selectedIndex].text, "system");
-    saveSettings();
-  });
-
-  function getChannel(targetCh) {
-    return channelMode === "ch1" ? 1 : targetCh;
+    maybeSendRequestState();
   }
 
-  function sendCC(targetChannel, controller, value, ccName) {
-    const ch = getChannel(targetChannel);
-    const val = parseInt(value, 10);
+  midiOutputSelect.addEventListener("change", (e) => {
+    if (!midiAccess) return;
+    const next = midiAccess.outputs.get(e.target.value);
+    if (!next) return;
+    const changed = !midiOutput || midiOutput.id !== next.id;
+    midiOutput = next;
+    statusDotEl.className = "indicator online";
+    statusTextEl.textContent = "Connected: " + midiOutput.name;
+    if (changed) {
+      log(`Selected output: ${midiOutput.name}`, "system");
+      saveSettings();
+    }
+    maybeSendRequestState();
+  });
 
-    if (midiOutput) {
-      if (midiOutput.connection !== "open") {
-        midiOutput.open().then(() => {
-          const status = 0xB0 | ((ch - 1) & 0x0F);
-          midiOutput.send([status, controller, val]);
-        });
-      } else {
-        const status = 0xB0 | ((ch - 1) & 0x0F);
-        midiOutput.send([status, controller, val]);
-      }
+  // The "Replies from" input select (BIDI_SPEC §5). By default it pairs
+  // with the selected output's name, else the first name containing IAC,
+  // Bus 1 or loopMIDI. Only the selected input gets an onmidimessage handler.
+  function attachInputHandler(input) {
+    if (midiInput && midiInput !== input) {
+      try { midiInput.onmidimessage = null; } catch (e) { /* ignore */ }
+    }
+    midiInput = input;
+    if (midiInput) midiInput.onmidimessage = onMIDIMessage;
+  }
+
+  async function updateInputs() {
+    if (!midiAccess) return;
+    const inputs = Array.from(midiAccess.inputs.values());
+    midiInputSelect.innerHTML = "";
+
+    if (inputs.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No MIDI input detected";
+      midiInputSelect.appendChild(opt);
+      const hadInput = !!midiInput;
+      if (midiInput) { try { midiInput.onmidimessage = null; } catch (e) { /* ignore */ } }
+      midiInput = null;
+      if (hadInput) log("Replies from: none (no input connected)", "system");
+      return;
     }
 
-    const msgClass = "ch" + targetChannel + "-msg";
-    log("[Ch " + ch + "] CC #" + controller + " (" + ccName + ") = " + val, msgClass);
+    inputs.forEach((input) => {
+      const opt = document.createElement("option");
+      opt.value = input.id;
+      opt.textContent = input.name;
+      midiInputSelect.appendChild(opt);
+    });
 
-    if (webAudioActive && audioEngine) {
-      audioEngine.updateParam(targetChannel, controller, val);
+    let chosen = midiInput ? inputs.find((i) => i.id === midiInput.id) || null : null;
+
+    if (!chosen) {
+      const savedName = getSavedInputName();
+      if (savedName) chosen = inputs.find((i) => i.name === savedName) || null;
+    }
+    if (!chosen && midiOutput) {
+      chosen = inputs.find((i) => i.name === midiOutput.name) || null;
+    }
+    if (!chosen) {
+      chosen = inputs.find((i) => /IAC|Bus 1|loopMIDI/.test(i.name)) || null;
+    }
+    if (!chosen) {
+      chosen = inputs[0];
+    }
+
+    const changed = !midiInput || midiInput.id !== chosen.id;
+    midiInputSelect.value = chosen.id;
+    attachInputHandler(chosen);
+
+    if (changed) {
+      log(`Replies from: ${midiInput.name}`, "system");
+      saveSettings();
+    }
+    maybeSendRequestState();
+  }
+
+  midiInputSelect.addEventListener("change", (e) => {
+    if (!midiAccess) return;
+    const next = midiAccess.inputs.get(e.target.value);
+    if (!next) return;
+    const changed = !midiInput || midiInput.id !== next.id;
+    attachInputHandler(next);
+    if (changed) {
+      log(`Replies from: ${midiInput.name}`, "system");
+      saveSettings();
+    }
+    maybeSendRequestState();
+  });
+
+  // Sends the request BF 01 7F once both the output and the input are
+  // selected, and again whenever either changes (BIDI_SPEC §2/§5).
+  let lastRequestPairKey = null;
+  function maybeSendRequestState() {
+    if (!midiOutput || !midiInput) return;
+    const key = midiOutput.id + "|" + midiInput.id;
+    if (key === lastRequestPairKey) return;
+    lastRequestPairKey = key;
+    const bytes = [0xBF, 1, 127];
+    try {
+      midiOutput.send(bytes);
+      log(`${bytesHex(bytes)}  Requesting engine state (Ch 16 CC 1 = 127)`, "system");
+    } catch (err) {
+      log("MIDI send failed: " + (err && err.message ? err.message : err), "alert");
     }
   }
 
-  function sendNote(targetChannel, note, velocity, noteName) {
-    const ch = getChannel(targetChannel);
-    const vel = parseInt(velocity, 10);
+  // ---------------------------------------------------------------------
+  // MIDI bytes: shared by the per-control byte readouts and the monitor.
+  // ---------------------------------------------------------------------
+  function bytesForControl(c, v) {
+    const status = 0xB0 | (c.ch - 1);
+    return [status, c.cc, v];
+  }
+
+  function bytesHex(bytes) {
+    return Array.from(bytes).map((b) => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
+  }
+
+  // Pitch-interval chips (CC 9-12) share one "last sent" byte readout
+  // instead of one each; every other control has its own `{id}-bytes`.
+  function bytesReadoutIdFor(c) {
+    return (c.kind === "chip" ? "ctl_intervals" : c.id) + "-bytes";
+  }
+
+  function setBytesReadoutText(id, hex) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = hex;
+  }
+
+  const bytesFlashTimers = {};
+
+  function flashBytesReadout(id, hex) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = hex;
+    el.classList.add("sent");
+    clearTimeout(bytesFlashTimers[id]);
+    bytesFlashTimers[id] = setTimeout(() => el.classList.remove("sent"), 400);
+  }
+
+  // Tracks the last time each control was actually sent, for the echo
+  // drag/keyboard guard's "300 ms after a local send" half (BIDI_SPEC §2).
+  const lastSentAt = {};
+
+  function sendCC(c, v) {
+    let val = Math.round(Number(v));
+    if (!Number.isFinite(val)) val = 0;
+    val = Math.max(0, Math.min(127, val));
+
+    const bytes = bytesForControl(c, val);
+    const hex = bytesHex(bytes);
+    const msgClass = "ch" + c.ch + "-msg";
+    const readoutId = bytesReadoutIdFor(c);
+    const desc = hex + "  Ch " + c.ch + " CC " + c.cc + " = " + val + " (" + c.label + " " + c.format(val) + ")";
 
     if (midiOutput) {
-      if (midiOutput.connection !== "open") {
-        midiOutput.open().then(() => {
-          const status = (vel > 0 ? 0x90 : 0x80) | ((ch - 1) & 0x0F);
-          midiOutput.send([status, note, vel]);
-        });
-      } else {
-        const status = (vel > 0 ? 0x90 : 0x80) | ((ch - 1) & 0x0F);
-        midiOutput.send([status, note, vel]);
+      try {
+        // send() opens the output implicitly if it isn't already open.
+        midiOutput.send(bytes);
+        lastSentAt[c.key] = Date.now();
+        log(desc, msgClass);
+        flashBytesReadout(readoutId, hex);
+      } catch (err) {
+        log("MIDI send failed: " + (err && err.message ? err.message : err), "alert");
+        setBytesReadoutText(readoutId, hex);
       }
+    } else {
+      // No output connected: the byte readout still shows the message for
+      // the current value at rest, but nothing was actually transmitted, so
+      // this neither triggers the "sent" flash nor logs as if it reached
+      // the engine — the log line says explicitly that it was dropped.
+      log(desc + " — not sent (no MIDI output)", msgClass);
+      setBytesReadoutText(readoutId, hex);
     }
 
-    const msgClass = "ch" + targetChannel + "-msg";
-    log("[Ch " + ch + "] Note #" + note + " (" + noteName + ") Vel: " + vel, msgClass);
+    return val;
   }
 
   function log(msg, type = "") {
     const timeStr = new Date().toISOString().substring(11, 19);
     const div = document.createElement("div");
     div.className = "log-entry " + type;
-    div.textContent = "[" + timeStr + "] " + msg;
+    div.textContent = timeStr + "  " + msg;
     logContainer.appendChild(div);
+    while (logContainer.children.length > LOG_MAX_ENTRIES) {
+      logContainer.removeChild(logContainer.firstChild);
+    }
     logContainer.scrollTop = logContainer.scrollHeight;
   }
 
@@ -352,840 +560,561 @@
     log("Log cleared.", "system");
   });
 
-  // Microphone Audio Capture Setup
-  async function toggleMicrophone() {
-    if (micActive) {
-      if (micStream) {
-        micStream.getTracks().forEach(track => track.stop());
-        micStream = null;
+  // ---------------------------------------------------------------------
+  // SysEx decoders (BIDI_SPEC §4) — one place, so every packet type is
+  // decoded consistently. Every packet is F0 7D 43 <type> <payload…> F7.
+  // ---------------------------------------------------------------------
+  function u14(p, o) { return (p[o] << 7) | p[o + 1]; }
+  function u21(p, o) { return (p[o] << 14) | (p[o + 1] << 7) | p[o + 2]; }
+  function u28(p, o) { return (p[o] << 21) | (p[o + 1] << 14) | (p[o + 2] << 7) | p[o + 3]; }
+
+  const SYSEX_TYPE = { HELLO: 0x01, HEAD: 0x02, GRAIN: 0x03, COLUMN: 0x04, DUMP: 0x05 };
+
+  const SYSEX = {
+    decode(data) {
+      if (!data || data.length < 5) return null;
+      if (data[0] !== 0xF0 || data[1] !== 0x7D || data[2] !== 0x43) return null;
+      if (data[data.length - 1] !== 0xF7) return null;
+      const type = data[3];
+      const payload = data.subarray ? data.subarray(4, data.length - 1) : Array.prototype.slice.call(data, 4, data.length - 1);
+      switch (type) {
+        case SYSEX_TYPE.HELLO: return SYSEX.decodeHello(payload);
+        case SYSEX_TYPE.HEAD: return SYSEX.decodeHead(payload);
+        case SYSEX_TYPE.GRAIN: return SYSEX.decodeGrain(payload);
+        case SYSEX_TYPE.COLUMN: return SYSEX.decodeColumn(payload);
+        case SYSEX_TYPE.DUMP: return SYSEX.decodeDump(payload);
+        default: return null;
       }
-      micActive = false;
-      micStateEl.textContent = "OFF";
-      btnMicInput.classList.remove("btn-primary");
-      btnMicInput.classList.add("btn-secondary");
-      log("Microphone recording disabled.", "system");
+    },
+    // version u7, bufferFrames u28, sampleRate u21, numCols u14, numTaps u7
+    decodeHello(p) {
+      if (p.length < 11) return null;
+      return {
+        type: "hello",
+        version: p[0],
+        bufferFrames: u28(p, 1),
+        sampleRate: u21(p, 5),
+        numCols: u14(p, 8),
+        numTaps: p[10],
+      };
+    },
+    // writeHead pos14, frozen u7
+    decodeHead(p) {
+      if (p.length < 3) return null;
+      return { type: "head", pos: u14(p, 0) / 16384, frozen: p[2] > 0 };
+    },
+    // tap u7, start pos14, durMs u14, rate u14, pan u7, amp u7
+    decodeGrain(p) {
+      if (p.length < 9) return null;
+      return {
+        type: "grain",
+        tap: p[0],
+        start: u14(p, 1) / 16384,
+        durMs: u14(p, 3),
+        rate: (u14(p, 5) - 8192) / 2048,
+        pan: (p[7] / 127) * 2 - 1,
+        amp: (p[8] / 127) * 3,
+      };
+    },
+    // col u14, peak u7
+    decodeColumn(p) {
+      if (p.length < 3) return null;
+      return { type: "column", col: u14(p, 0), peak: p[2] / 127 };
+    },
+    // startCol u14, count u14, then `count` peak u7 bytes
+    decodeDump(p) {
+      if (p.length < 4) return null;
+      const startCol = u14(p, 0);
+      const count = u14(p, 2);
+      if (p.length < 4 + count) return null; // truncated: reject rather than zero-fill
+      const peaks = new Array(count);
+      for (let i = 0; i < count; i++) peaks[i] = p[4 + i] / 127;
+      return { type: "dump", startCol, count, peaks };
+    },
+  };
+
+  // ---------------------------------------------------------------------
+  // Engine telemetry state — mutated only by message handlers, drawn only
+  // by requestAnimationFrame (BIDI_SPEC §5, "Rendering").
+  // ---------------------------------------------------------------------
+  const engine = {
+    hello: null, // { version, bufferFrames, sampleRate, numCols, numTaps }
+    colPeaks: null, // Float32Array(numCols), 0..1
+    head: { pos: 0, frozen: false, lastUpdate: 0 },
+    grains: [], // { tap, start, durMs, rate, pan, amp, createdAt }
+  };
+  const GRAIN_CAP = 400;
+  let lastEngineActivity = 0;
+  let grainCounter = 0;
+  let headCounter = 0;
+
+  function formatSpan(sec) {
+    if (!Number.isFinite(sec) || sec <= 0) return "—";
+    return (sec >= 10 ? Math.round(sec) : sec.toFixed(1)) + " s";
+  }
+
+  function onHello(d) {
+    engine.hello = { version: d.version, bufferFrames: d.bufferFrames, sampleRate: d.sampleRate, numCols: d.numCols, numTaps: d.numTaps };
+    engine.colPeaks = new Float32Array(Math.max(1, d.numCols));
+    engine.grains = [];
+    engine.head = { pos: 0, frozen: false, lastUpdate: performance.now() };
+    if (scopeSpanLabelEl) {
+      const spanSec = d.sampleRate > 0 ? d.bufferFrames / d.sampleRate : 0;
+      scopeSpanLabelEl.textContent = `${formatSpan(spanSec)} buffer`;
+    }
+    log("Engine started", "system");
+  }
+
+  function onHead(d) {
+    if (!engine.hello) return;
+    engine.head.pos = d.pos;
+    engine.head.frozen = d.frozen;
+    engine.head.lastUpdate = performance.now();
+    headCounter++;
+  }
+
+  function onGrain(d) {
+    if (!engine.hello) return;
+    engine.grains.push({ tap: d.tap, start: d.start, durMs: d.durMs, rate: d.rate, pan: d.pan, amp: d.amp, createdAt: performance.now() });
+    if (engine.grains.length > GRAIN_CAP) engine.grains.shift();
+    grainCounter++;
+  }
+
+  function onColumn(d) {
+    if (!engine.colPeaks) return;
+    if (d.col >= 0 && d.col < engine.colPeaks.length) engine.colPeaks[d.col] = d.peak;
+  }
+
+  function onDump(d) {
+    if (!engine.colPeaks) return;
+    for (let i = 0; i < d.count; i++) {
+      const idx = d.startCol + i;
+      if (idx >= 0 && idx < engine.colPeaks.length) engine.colPeaks[idx] = d.peaks[i];
+    }
+    log(`DUMP: columns ${d.startCol}–${d.startCol + d.count - 1} (${d.count})`, "system");
+  }
+
+  function handleTelemetryPacket(decoded) {
+    switch (decoded.type) {
+      case "hello": onHello(decoded); break;
+      case "head": onHead(decoded); break;
+      case "grain": onGrain(decoded); break;
+      case "column": onColumn(decoded); break;
+      case "dump": onDump(decoded); break;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Incoming MIDI: echo (Ch 9-11 CC) and SysEx telemetry only. The page
+  // ignores everything else, including its own looped-back Ch 1-3/16
+  // messages (BIDI_SPEC §1 "Loop safety").
+  // ---------------------------------------------------------------------
+  function onMIDIMessage(e) {
+    const data = e.data;
+    if (!data || data.length === 0) return;
+
+    if (data[0] === 0xF0) {
+      const decoded = SYSEX.decode(data);
+      if (!decoded) return; // not one of ours, or malformed
+      lastEngineActivity = Date.now();
+      handleTelemetryPacket(decoded);
+      return;
+    }
+
+    const status = data[0];
+    if ((status & 0xF0) !== 0xB0) return; // only Control Change matters here
+    const chan0 = status & 0x0F; // 0-based MIDI channel
+    const cc = data[1];
+    const val = data[2];
+
+    if (chan0 >= 8 && chan0 <= 10) {
+      // Echo channels 9-11 (0-based 8-10): the same CC SC just applied.
+      lastEngineActivity = Date.now();
+      handleEcho(chan0 - 8 + 1, cc, val);
+      return;
+    }
+
+    // Anything else — our own looped-back Ch 1-3/16 messages, other
+    // channels, other CCs — is ignored, silently and on purpose.
+  }
+
+  // Controls the user is actively dragging/keying, so an in-flight echo
+  // for them is ignored rather than fighting the interaction. Pointers are
+  // tracked per pointerId so simultaneous (multi-touch) drags release
+  // independently.
+  const pointerOwners = new Map(); // pointerId -> control key
+  const keyboardActive = new Set(); // control keys with a key held down
+
+  function isInteracting(key) {
+    if (keyboardActive.has(key)) return true;
+    for (const owner of pointerOwners.values()) if (owner === key) return true;
+    return false;
+  }
+
+  function handleEcho(ch, cc, val) {
+    const c = CONTROLS_BY_CHCC[ch + ":" + cc];
+    if (!c) return; // unlisted CC on an echo channel; ignore silently
+
+    const interacting = isInteracting(c.key);
+    const recentlySent = (Date.now() - (lastSentAt[c.key] || 0)) < 300;
+    if (interacting || recentlySent) return; // BIDI_SPEC §2 drag/keyboard + 300ms guard
+
+    let appliedValue;
+    if (c.kind === "slider") {
+      appliedValue = Math.max(0, Math.min(127, Math.round(Number(val)) || 0));
+      state[c.key] = appliedValue;
+      updateSliderUI(c, appliedValue);
     } else {
-      try {
-        log("Requesting microphone permissions...", "system");
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-        micAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        if (micAudioCtx.state === "suspended") {
-          await micAudioCtx.resume();
+      const on = val > 0;
+      state[c.key] = on;
+      appliedValue = on ? 127 : 0;
+      if (c.kind === "chip") {
+        updateChipUI(c, on);
+        updateIntervalStatusText();
+      } else {
+        updateToggleUI(c, on);
+      }
+    }
+    setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, appliedValue)));
+    saveSettings(); // never sends MIDI in response — this only updates local state/UI/storage
+
+    const echoStatus = 0xB0 | ((ch - 1) + 8);
+    log(`${bytesHex([echoStatus, cc, val])} echo Ch ${ch} CC ${cc}`, "system");
+  }
+
+  // ---------------------------------------------------------------------
+  // Engine status (heartbeat) and telemetry rate line
+  // ---------------------------------------------------------------------
+  function updateEngineStatusUI() {
+    const alive = (Date.now() - lastEngineActivity) < 2000;
+    if (engineDotEl) engineDotEl.className = "indicator " + (alive ? "online" : "offline");
+    if (engineStatusTextEl) engineStatusTextEl.textContent = alive ? "Engine running" : "No reply from the engine";
+  }
+
+  function updateTelemetryLine() {
+    const g = grainCounter;
+    const h = headCounter;
+    grainCounter = 0;
+    headCounter = 0;
+    if (telemetryLineEl) telemetryLineEl.textContent = `Telemetry: ${g} grains/s, head ${h}/s`;
+  }
+
+  // ---------------------------------------------------------------------
+  // Generic CONTROLS-driven wiring / labels / reset / restore / sync / panic
+  // ---------------------------------------------------------------------
+  function updateSliderUI(c, v) {
+    const el = document.getElementById(c.id);
+    if (el) el.value = v;
+    const labelEl = document.getElementById(c.id + "-val");
+    if (labelEl) labelEl.textContent = c.format(v);
+  }
+
+  // Two-segment on/off controls (passthrough, delay in, delay out, freeze):
+  // both halves are always visible; only the pressed half changes.
+  function updateToggleUI(c, on) {
+    const container = document.getElementById(c.id);
+    if (!container) return;
+    container.querySelectorAll(".seg-btn").forEach((btn) => {
+      const btnIsOnHalf = btn.dataset.state === "on";
+      btn.setAttribute("aria-pressed", String(btnIsOnHalf === on));
+    });
+  }
+
+  // Pitch-interval chips: only aria-pressed (and its CSS) changes — the
+  // chip's own label/CC caption is never overwritten.
+  function updateChipUI(c, on) {
+    const el = document.getElementById(c.id);
+    if (el) el.setAttribute("aria-pressed", String(on));
+  }
+
+  function updateIntervalStatusText() {
+    const statusEl = document.getElementById("val_intervals_status");
+    if (!statusEl) return;
+    const names = [];
+    if (state.octavesOn) names.push("Octaves");
+    if (state.fifthsOn) names.push("Fifths & fourths");
+    if (state.suboctavesOn) names.push("Sub-octaves");
+    if (state.reverseOn) names.push("Reverse");
+    statusEl.textContent = names.length > 0 ? names.join(" + ") : "Base intervals";
+  }
+
+  // Shows the shared "last sent" interval byte readout at rest (before
+  // anything has actually been sent this session): the first toggle that's
+  // on, or Octaves (CC9) as a representative default.
+  function updateIntervalBytesAtRest() {
+    const onKey = INTERVAL_KEYS.find((k) => state[k]);
+    const c = CONTROLS_BY_KEY[onKey || "octavesOn"];
+    const v = state[c.key] ? 127 : 0;
+    setBytesReadoutText("ctl_intervals-bytes", bytesHex(bytesForControl(c, v)));
+  }
+
+  // Central setter: every control mutation (slider input, dblclick reset,
+  // toggle/chip click, Send All, Mute all) funnels through here so state,
+  // UI, localStorage and outgoing MIDI always stay in sync.
+  function setControlValue(c, rawValue) {
+    if (c.kind === "slider") {
+      let v = Math.round(Number(rawValue));
+      if (!Number.isFinite(v)) v = c.def;
+      v = Math.max(0, Math.min(127, v));
+      state[c.key] = v;
+      updateSliderUI(c, v);
+      sendCC(c, v);
+    } else {
+      const on = Boolean(rawValue);
+      state[c.key] = on;
+      if (c.kind === "chip") {
+        updateChipUI(c, on);
+        updateIntervalStatusText();
+      } else {
+        updateToggleUI(c, on);
+      }
+      sendCC(c, on ? 127 : 0);
+    }
+    saveSettings();
+  }
+
+  function wireControls() {
+    CONTROLS.forEach((c) => {
+      if (c.kind === "slider") {
+        const el = document.getElementById(c.id);
+        if (!el) {
+          console.warn("Missing control element for", c.key, "(#" + c.id + ")");
+          return;
         }
-        const source = micAudioCtx.createMediaStreamSource(micStream);
-        micAnalyser = micAudioCtx.createAnalyser();
-        micAnalyser.fftSize = 256;
-        source.connect(micAnalyser);
-        micDataArray = new Uint8Array(micAnalyser.frequencyBinCount);
-
-        micActive = true;
-        micStateEl.textContent = "ON";
-        btnMicInput.classList.remove("btn-secondary");
-        btnMicInput.classList.add("btn-primary");
-        log("Microphone recording active.", "system");
-      } catch (err) {
-        log("Microphone Access Error: " + err.message, "alert");
+        el.dataset.default = c.def;
+        el.addEventListener("input", (e) => setControlValue(c, e.target.value));
+        el.addEventListener("dblclick", () => {
+          setControlValue(c, c.def);
+          log(`Reset ${c.label} to default (${c.def}).`, "system");
+        });
+        // Drag/keyboard guard (BIDI_SPEC §2): ignore echoes for a control
+        // while the user is actively interacting with it.
+        el.addEventListener("pointerdown", (e) => {
+          // A fresh press can't overlap a drag already in progress on this
+          // same control, so any entry still claiming it is stale (its
+          // pointerup was lost, e.g. a dropped touch). Clear it first.
+          for (const [id, key] of pointerOwners) if (key === c.key) pointerOwners.delete(id);
+          pointerOwners.set(e.pointerId, c.key);
+        });
+        el.addEventListener("keydown", () => keyboardActive.add(c.key));
+        el.addEventListener("keyup", () => keyboardActive.delete(c.key));
+        el.addEventListener("blur", () => keyboardActive.delete(c.key));
+      } else if (c.kind === "chip") {
+        const el = document.getElementById(c.id);
+        if (!el) {
+          console.warn("Missing control element for", c.key, "(#" + c.id + ")");
+          return;
+        }
+        el.addEventListener("click", () => setControlValue(c, !state[c.key]));
+      } else {
+        // Two-segment control: clicking a half sets that state explicitly.
+        const container = document.getElementById(c.id);
+        if (!container) {
+          console.warn("Missing control element for", c.key, "(#" + c.id + ")");
+          return;
+        }
+        container.querySelectorAll(".seg-btn").forEach((btn) => {
+          btn.addEventListener("click", () => setControlValue(c, btn.dataset.state === "on"));
+        });
       }
-    }
+    });
   }
 
-  btnMicInput.addEventListener("click", toggleMicrophone);
+  // Release a pointer's drag guard wherever the pointer lifts, since
+  // pointerup can land outside the element that started the drag.
+  window.addEventListener("pointerup", (e) => pointerOwners.delete(e.pointerId));
+  window.addEventListener("pointercancel", (e) => pointerOwners.delete(e.pointerId));
+  // A tab hidden mid-drag often never delivers the pointerup/keyup.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { pointerOwners.clear(); keyboardActive.clear(); }
+  });
 
-  function getMicSample() {
-    if (!micActive || !micAnalyser || !micDataArray) return 0;
-    micAnalyser.getByteTimeDomainData(micDataArray);
-    let maxDiff = 0;
-    for (let i = 0; i < micDataArray.length; i++) {
-      const diff = (micDataArray[i] - 128) / 128;
-      if (Math.abs(diff) > Math.abs(maxDiff)) {
-        maxDiff = diff;
+  function restoreControlsFromState() {
+    CONTROLS.forEach((c) => {
+      if (c.kind === "slider") {
+        updateSliderUI(c, state[c.key]);
+        setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, state[c.key])));
+      } else if (c.kind === "chip") {
+        updateChipUI(c, state[c.key]);
+      } else {
+        updateToggleUI(c, state[c.key]);
+        setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, state[c.key] ? 127 : 0)));
       }
-    }
-    return maxDiff * 1.8;
+    });
+    updateIntervalStatusText();
+    updateIntervalBytesAtRest();
   }
 
-  // Setup UI Listeners & Double-Click Reset
   function setupUIControls() {
-    function setupResetableSlider(sliderEl, onUpdate) {
-      sliderEl.addEventListener("input", (e) => {
-        onUpdate(parseInt(e.target.value, 10));
-        saveSettings();
-      });
-      sliderEl.addEventListener("dblclick", () => {
-        const def = parseInt(sliderEl.getAttribute("data-default") || "64", 10);
-        sliderEl.value = def;
-        onUpdate(def);
-        saveSettings();
-        log(`Reset ${sliderEl.id} to default (${def})`, "system");
-      });
-    }
-
-    // Channel 1: Master Output Level (CC 7)
-    const cc7_masterVol = document.getElementById("cc7_masterVol");
-    const val_cc7_ch1 = document.getElementById("val_cc7_ch1");
-    setupResetableSlider(cc7_masterVol, (v) => {
-      state.masterVol = v;
-      const gain = (v / 51).toFixed(2);
-      val_cc7_ch1.textContent = `${gain}x (${v <= 51 ? 'Normal' : 'Boost'})`;
-      sendCC(1, 7, v, "Master Output Level");
-    });
-
-    // Channel 1: Main Controls
-    const cc1_passthru = document.getElementById("cc1_passthru");
-    const val_cc1_ch1 = document.getElementById("val_cc1_ch1");
-    setupResetableSlider(cc1_passthru, (v) => {
-      state.passLevel = v;
-      val_cc1_ch1.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(1, 1, v, "Input Passthrough Level");
-    });
-
-    const btnCc4 = document.getElementById("btn_cc4");
-    btnCc4.addEventListener("click", () => {
-      state.passMute = !state.passMute;
-      btnCc4.classList.toggle("active", state.passMute);
-      btnCc4.textContent = state.passMute ? "MUTE" : "MUTED";
-      sendCC(1, 4, state.passMute ? 127 : 0, "Passthrough Mute CC");
-      sendNote(1, 60, state.passMute ? 127 : 0, "Passthrough Mute Note");
-      saveSettings();
-    });
-
-    const cc2_delayIn = document.getElementById("cc2_delayIn");
-    const val_cc2_ch1 = document.getElementById("val_cc2_ch1");
-    setupResetableSlider(cc2_delayIn, (v) => {
-      state.delayInLevel = v;
-      val_cc2_ch1.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(1, 2, v, "Delay Input Level");
-    });
-
-    const btnCc5 = document.getElementById("btn_cc5");
-    btnCc5.addEventListener("click", () => {
-      state.delayInMute = !state.delayInMute;
-      btnCc5.classList.toggle("active", state.delayInMute);
-      btnCc5.textContent = state.delayInMute ? "MUTE" : "MUTED";
-      sendCC(1, 5, state.delayInMute ? 127 : 0, "Delay Input Mute CC");
-      sendNote(1, 61, state.delayInMute ? 127 : 0, "Delay Input Mute Note");
-      saveSettings();
-    });
-
-    const cc3_preserve = document.getElementById("cc3_preserve");
-    const val_cc3_ch1 = document.getElementById("val_cc3_ch1");
-    setupResetableSlider(cc3_preserve, (v) => {
-      state.preserveLevel = v;
-      val_cc3_ch1.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(1, 3, v, "Buffer Sound Preservation");
-    });
-
-    const btnCc6 = document.getElementById("btn_cc6");
-    btnCc6.addEventListener("click", () => {
-      state.delayOutMute = !state.delayOutMute;
-      btnCc6.classList.toggle("active", state.delayOutMute);
-      btnCc6.textContent = state.delayOutMute ? "DELAY OUTPUT ACTIVE" : "DELAY OUTPUT MUTED";
-      sendCC(1, 6, state.delayOutMute ? 127 : 0, "Delay Output Mute CC");
-      sendNote(1, 62, state.delayOutMute ? 127 : 0, "Delay Output Mute Note");
-      saveSettings();
-    });
-
-    // Channel 2: Feedback Controls
-    const cc1_fbAmp = document.getElementById("cc1_fbAmp");
-    const val_cc1_ch2 = document.getElementById("val_cc1_ch2");
-    setupResetableSlider(cc1_fbAmp, (v) => {
-      state.fbLevel = v;
-      val_cc1_ch2.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(2, 1, v, "Feedback Level");
-    });
-
-    const cc2_fbBal = document.getElementById("cc2_fbBal");
-    const val_cc2_ch2 = document.getElementById("val_cc2_ch2");
-    setupResetableSlider(cc2_fbBal, (v) => {
-      state.fbBalance = v;
-      const balNorm = (v - 64) / 64;
-      val_cc2_ch2.textContent = balNorm === 0 ? "Center" : balNorm < 0 ? "L " + Math.abs(Math.round(balNorm * 100)) + "%" : "R " + Math.round(balNorm * 100) + "%";
-      sendCC(2, 2, v, "Feedback Balance");
-    });
-
-    const cc3_fbHp = document.getElementById("cc3_fbHp");
-    const val_cc3_ch2 = document.getElementById("val_cc3_ch2");
-    setupResetableSlider(cc3_fbHp, (v) => {
-      state.fbHp = v;
-      const hz = Math.round((v / 127) * 220);
-      val_cc3_ch2.textContent = hz + " Hz";
-      sendCC(2, 3, v, "Feedback Highpass Hz");
-    });
-
-    const cc4_fbNoise = document.getElementById("cc4_fbNoise");
-    const val_cc4_ch2 = document.getElementById("val_cc4_ch2");
-    setupResetableSlider(cc4_fbNoise, (v) => {
-      state.fbNoise = v;
-      val_cc4_ch2.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(2, 4, v, "Pink Noise Level");
-    });
-
-    const cc5_fbSineLvl = document.getElementById("cc5_fbSineLvl");
-    const val_cc5_ch2 = document.getElementById("val_cc5_ch2");
-    setupResetableSlider(cc5_fbSineLvl, (v) => {
-      state.fbSineLevel = v;
-      val_cc5_ch2.textContent = Math.round((v / 127) * 100) + "%";
-      sendCC(2, 5, v, "Sine Level");
-    });
-
-    const cc6_fbSinePitch = document.getElementById("cc6_fbSinePitch");
-    const val_cc6_ch2 = document.getElementById("val_cc6_ch2");
-    setupResetableSlider(cc6_fbSinePitch, (v) => {
-      state.fbSinePitch = v;
-      const midiNote = Math.round(20 + (v / 127) * 70);
-      const hz = Math.round(440 * Math.pow(2, (midiNote - 69) / 12));
-      val_cc6_ch2.textContent = hz + " Hz";
-      sendCC(2, 6, v, "Sine Frequency");
-    });
-
-    // Channel 3: Granular Controls
-    // Buffer Record Freeze Toggle (CC 8 / Note 63)
-    const btnFreeze = document.getElementById("btn_freeze");
-    btnFreeze.addEventListener("click", () => {
-      state.freeze = !state.freeze;
-      btnFreeze.classList.toggle("active", state.freeze);
-      btnFreeze.textContent = state.freeze ? "RECORDING FROZEN (MEMORY HELD)" : "RECORDING ACTIVE (FREEZE OFF)";
-      sendCC(3, 8, state.freeze ? 127 : 0, "Buffer Record Freeze CC");
-      sendNote(3, 63, state.freeze ? 127 : 0, "Buffer Record Freeze Note");
-      saveSettings();
-    });
-
-    // Independent Additive Interval Toggles (CC 9, 10, 11, 12)
-    const val_intervals_status = document.getElementById("val_intervals_status");
-
-    function updateIntervalStatusText() {
-      let activeNames = [];
-      if (intervalToggles.octaves) activeNames.push("Octaves");
-      if (intervalToggles.fifths) activeNames.push("5ths/4ths");
-      if (intervalToggles.suboctaves) activeNames.push("Sub-Oct");
-      if (intervalToggles.reverse) activeNames.push("Reverse");
-      val_intervals_status.textContent = activeNames.length > 0 ? activeNames.join(" + ") : "Default [1/4..2/1]";
-    }
-
-    const btnOctaves = document.getElementById("btn_octaves");
-    btnOctaves.addEventListener("click", () => {
-      intervalToggles.octaves = !intervalToggles.octaves;
-      btnOctaves.classList.toggle("active", intervalToggles.octaves);
-      updateIntervalStatusText();
-      sendCC(3, 9, intervalToggles.octaves ? 127 : 0, "Pitch Octaves Toggle");
-      saveSettings();
-    });
-
-    const btnFifths = document.getElementById("btn_fifths");
-    btnFifths.addEventListener("click", () => {
-      intervalToggles.fifths = !intervalToggles.fifths;
-      btnFifths.classList.toggle("active", intervalToggles.fifths);
-      updateIntervalStatusText();
-      sendCC(3, 10, intervalToggles.fifths ? 127 : 0, "Pitch 5ths & 4ths Toggle");
-      saveSettings();
-    });
-
-    const btnSuboctaves = document.getElementById("btn_suboctaves");
-    btnSuboctaves.addEventListener("click", () => {
-      intervalToggles.suboctaves = !intervalToggles.suboctaves;
-      btnSuboctaves.classList.toggle("active", intervalToggles.suboctaves);
-      updateIntervalStatusText();
-      sendCC(3, 11, intervalToggles.suboctaves ? 127 : 0, "Pitch Sub-Octaves Toggle");
-      saveSettings();
-    });
-
-    const btnReverse = document.getElementById("btn_reverse");
-    btnReverse.addEventListener("click", () => {
-      intervalToggles.reverse = !intervalToggles.reverse;
-      btnReverse.classList.toggle("active", intervalToggles.reverse);
-      updateIntervalStatusText();
-      sendCC(3, 12, intervalToggles.reverse ? 127 : 0, "Reverse Grains Toggle");
-      saveSettings();
-    });
-
-    // Pointer Position Jitter / Spread (CC 4)
-    const cc4_jumble = document.getElementById("cc4_jumble");
-    const val_cc4_ch3 = document.getElementById("val_cc4_ch3");
-    setupResetableSlider(cc4_jumble, (v) => {
-      state.jumble = v;
-      const secs = ((v / 127) * 2.5).toFixed(2);
-      val_cc4_ch3.textContent = `${secs}s ${v === 0 ? '(Default)' : ''}`;
-      sendCC(3, 4, v, "Position Jitter Spread");
-    });
-
-    // Grain Trigger Distribution (CC 5)
-    const cc5_sync = document.getElementById("cc5_sync");
-    const val_cc5_ch3 = document.getElementById("val_cc5_ch3");
-    setupResetableSlider(cc5_sync, (v) => {
-      state.syncMode = v;
-      val_cc5_ch3.textContent = v === 127 ? "Periodic (Default)" : v === 0 ? "Poisson (Dust)" : `Continuous (${Math.round((v / 127) * 100)}%)`;
-      sendCC(3, 5, v, "Trigger Distribution");
-    });
-
-    // Grain Window Function (CC 6)
-    const cc6_envShape = document.getElementById("cc6_envShape");
-    const val_cc6_ch3 = document.getElementById("val_cc6_ch3");
-    setupResetableSlider(cc6_envShape, (v) => {
-      state.envShape = v;
-      const idx = Math.min(2, Math.floor(v / 43));
-      val_cc6_ch3.textContent = envWindows[idx];
-      sendCC(3, 6, v, "Grain Window Function");
-    });
-
-    // Playback Rate Multiplier (CC 1)
-    const cc1_grainRate = document.getElementById("cc1_grainRate");
-    const val_cc1_ch3 = document.getElementById("val_cc1_ch3");
-    setupResetableSlider(cc1_grainRate, (v) => {
-      state.grainRate = v;
-      const scale = (0.25 + (v / 127) * 1.75).toFixed(2);
-      val_cc1_ch3.textContent = scale + "x";
-      sendCC(3, 1, v, "Playback Rate Multiplier");
-    });
-
-    // Grain Density Multiplier (CC 2)
-    const cc2_grainDens = document.getElementById("cc2_grainDens");
-    const val_cc2_ch3 = document.getElementById("val_cc2_ch3");
-    setupResetableSlider(cc2_grainDens, (v) => {
-      state.grainDens = v;
-      const scale = (0.2 + (v / 127) * 2.8).toFixed(2);
-      val_cc2_ch3.textContent = scale + "x";
-      sendCC(3, 2, v, "Grain Density Multiplier");
-    });
-
-    // Low-Pass Filter Cutoff (CC 3)
-    const cc3_cutoff = document.getElementById("cc3_cutoff");
-    const val_cc3_ch3 = document.getElementById("val_cc3_ch3");
-    setupResetableSlider(cc3_cutoff, (v) => {
-      state.cutoff = v;
-      const hz = Math.round(200 * Math.pow(80, v / 127));
-      val_cc3_ch3.textContent = hz + " Hz";
-      sendCC(3, 3, v, "Low-Pass Filter Cutoff");
-    });
+    wireControls();
 
     btnSendAll.addEventListener("click", () => {
-      log("Syncing all parameters...", "system");
-      sendCC(1, 7, state.masterVol, "Master Output Level");
-      sendCC(1, 1, state.passLevel, "Input Passthrough Level");
-      sendCC(1, 2, state.delayInLevel, "Delay Input Level");
-      sendCC(1, 3, state.preserveLevel, "Buffer Sound Preservation");
-      sendCC(1, 4, state.passMute ? 127 : 0, "Passthrough Mute");
-      sendCC(1, 5, state.delayInMute ? 127 : 0, "Delay Input Mute");
-      sendCC(1, 6, state.delayOutMute ? 127 : 0, "Delay Out Mute");
-
-      sendCC(2, 1, state.fbLevel, "Feedback Level");
-      sendCC(2, 2, state.fbBalance, "Feedback Balance");
-      sendCC(2, 3, state.fbHp, "Feedback Highpass Hz");
-      sendCC(2, 4, state.fbNoise, "Pink Noise Level");
-      sendCC(2, 5, state.fbSineLevel, "Sine Level");
-      sendCC(2, 6, state.fbSinePitch, "Sine Frequency");
-
-      sendCC(3, 1, state.grainRate, "Playback Rate Multiplier");
-      sendCC(3, 2, state.grainDens, "Grain Density Multiplier");
-      sendCC(3, 3, state.cutoff, "Low-Pass Filter Cutoff");
-      sendCC(3, 4, state.jumble, "Position Jitter Spread");
-      sendCC(3, 5, state.syncMode, "Trigger Distribution");
-      sendCC(3, 6, state.envShape, "Grain Window Function");
-      sendCC(3, 8, state.freeze ? 127 : 0, "Buffer Record Freeze");
-      sendCC(3, 9, intervalToggles.octaves ? 127 : 0, "Pitch Octaves Toggle");
-      sendCC(3, 10, intervalToggles.fifths ? 127 : 0, "Pitch 5ths & 4ths Toggle");
-      sendCC(3, 11, intervalToggles.suboctaves ? 127 : 0, "Pitch Sub-Octaves Toggle");
-      sendCC(3, 12, intervalToggles.reverse ? 127 : 0, "Reverse Grains Toggle");
+      log("Sending all values…", "system");
+      CONTROLS.forEach((c) => {
+        const v = c.kind === "slider" ? state[c.key] : (state[c.key] ? 127 : 0);
+        sendCC(c, v);
+      });
     });
 
     btnPanic.addEventListener("click", () => {
       log("Muting all outputs...", "alert");
-      sendCC(1, 1, 0, "Passthrough Mute");
-      sendCC(1, 2, 0, "Delay In Mute");
-      sendCC(1, 6, 0, "Delay Out Mute");
-      sendCC(2, 1, 0, "FB Level Mute");
-      document.getElementById("cc1_passthru").value = 0;
-      document.getElementById("cc2_delayIn").value = 0;
-      document.getElementById("cc1_fbAmp").value = 0;
-      val_cc1_ch1.textContent = "0%";
-      val_cc2_ch1.textContent = "0%";
-      val_cc1_ch2.textContent = "0%";
+      setControlValue(CONTROLS_BY_KEY.passLevel, 0);
+      setControlValue(CONTROLS_BY_KEY.delayInLevel, 0);
+      setControlValue(CONTROLS_BY_KEY.delayOutOn, false);
+      setControlValue(CONTROLS_BY_KEY.fbLevel, 0);
     });
 
-    // Restore Slider Positions, Toggle States & Display Labels from Loaded Settings
-    function restoreControlsFromState() {
-      cc7_masterVol.value = state.masterVol;
-      val_cc7_ch1.textContent = `${(state.masterVol / 51).toFixed(2)}x (${state.masterVol <= 51 ? 'Normal' : 'Boost'})`;
-
-      cc1_passthru.value = state.passLevel;
-      val_cc1_ch1.textContent = Math.round((state.passLevel / 127) * 100) + "%";
-
-      btnCc4.classList.toggle("active", state.passMute);
-      btnCc4.textContent = state.passMute ? "MUTE" : "MUTED";
-
-      cc2_delayIn.value = state.delayInLevel;
-      val_cc2_ch1.textContent = Math.round((state.delayInLevel / 127) * 100) + "%";
-
-      btnCc5.classList.toggle("active", state.delayInMute);
-      btnCc5.textContent = state.delayInMute ? "MUTE" : "MUTED";
-
-      cc3_preserve.value = state.preserveLevel;
-      val_cc3_ch1.textContent = Math.round((state.preserveLevel / 127) * 100) + "%";
-
-      btnCc6.classList.toggle("active", state.delayOutMute);
-      btnCc6.textContent = state.delayOutMute ? "DELAY OUTPUT ACTIVE" : "DELAY OUTPUT MUTED";
-
-      cc1_fbAmp.value = state.fbLevel;
-      val_cc1_ch2.textContent = Math.round((state.fbLevel / 127) * 100) + "%";
-
-      cc2_fbBal.value = state.fbBalance;
-      const balNorm = (state.fbBalance - 64) / 64;
-      val_cc2_ch2.textContent = balNorm === 0 ? "Center" : balNorm < 0 ? "L " + Math.abs(Math.round(balNorm * 100)) + "%" : "R " + Math.round(balNorm * 100) + "%";
-
-      cc3_fbHp.value = state.fbHp;
-      val_cc3_ch2.textContent = Math.round((state.fbHp / 127) * 220) + " Hz";
-
-      cc4_fbNoise.value = state.fbNoise;
-      val_cc4_ch2.textContent = Math.round((state.fbNoise / 127) * 100) + "%";
-
-      cc5_fbSineLvl.value = state.fbSineLevel;
-      val_cc5_ch2.textContent = Math.round((state.fbSineLevel / 127) * 100) + "%";
-
-      cc6_fbSinePitch.value = state.fbSinePitch;
-      const midiNote = Math.round(20 + (state.fbSinePitch / 127) * 70);
-      val_cc6_ch2.textContent = Math.round(440 * Math.pow(2, (midiNote - 69) / 12)) + " Hz";
-
-      btnFreeze.classList.toggle("active", state.freeze);
-      btnFreeze.textContent = state.freeze ? "RECORDING FROZEN (MEMORY HELD)" : "RECORDING ACTIVE (FREEZE OFF)";
-
-      btnOctaves.classList.toggle("active", intervalToggles.octaves);
-      btnFifths.classList.toggle("active", intervalToggles.fifths);
-      btnSuboctaves.classList.toggle("active", intervalToggles.suboctaves);
-      btnReverse.classList.toggle("active", intervalToggles.reverse);
-      updateIntervalStatusText();
-
-      cc4_jumble.value = state.jumble;
-      val_cc4_ch3.textContent = `${((state.jumble / 127) * 2.5).toFixed(2)}s ${state.jumble === 0 ? '(Default)' : ''}`;
-
-      cc5_sync.value = state.syncMode;
-      val_cc5_ch3.textContent = state.syncMode === 127 ? "Periodic (Default)" : state.syncMode === 0 ? "Poisson (Dust)" : `Continuous (${Math.round((state.syncMode / 127) * 100)}%)`;
-
-      cc6_envShape.value = state.envShape;
-      val_cc6_ch3.textContent = envWindows[Math.min(2, Math.floor(state.envShape / 43))];
-
-      cc1_grainRate.value = state.grainRate;
-      val_cc1_ch3.textContent = (0.25 + (state.grainRate / 127) * 1.75).toFixed(2) + "x";
-
-      cc2_grainDens.value = state.grainDens;
-      val_cc2_ch3.textContent = (0.2 + (state.grainDens / 127) * 2.8).toFixed(2) + "x";
-
-      cc3_cutoff.value = state.cutoff;
-      val_cc3_ch3.textContent = Math.round(200 * Math.pow(80, state.cutoff / 127)) + " Hz";
-
-      midiChannelModeSelect.value = channelMode;
-    }
-
     restoreControlsFromState();
-    if (savedSettings) {
-      log("Restored settings from previous session (localStorage). Use \"Send All\" once your MIDI output is connected to sync the engine.", "system");
+    if (readSettingsRaw()) {
+      log('Restored settings from previous session (localStorage). Use "Send all values" once your MIDI output is connected to sync the engine.', "system");
     }
   }
 
-  /**
-   * Granular Ambient Sound Simulation Engine
-   */
-  class WebAudioSynthSimulation {
-    constructor() {
-      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-      this.masterGain = this.ctx.createGain();
-      this.masterGain.gain.value = 1.0;
+  // ---------------------------------------------------------------------
+  // Buffer scope — drawn purely from engine telemetry (BIDI_SPEC §5).
+  // Message handlers above only mutate `engine`; only this function draws.
+  // ---------------------------------------------------------------------
+  function wrap01(x) { return ((x % 1) + 1) % 1; }
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
-      this.analyser = this.ctx.createAnalyser();
-      this.analyser.fftSize = 256;
-      this.analyserData = new Uint8Array(this.analyser.frequencyBinCount);
-
-      this.filterNode = this.ctx.createBiquadFilter();
-      this.filterNode.type = "lowpass";
-      this.filterNode.frequency.value = 12000;
-
-      this.hpFilter = this.ctx.createBiquadFilter();
-      this.hpFilter.type = "highpass";
-      this.hpFilter.frequency.value = 12;
-
-      this.feedbackGain = this.ctx.createGain();
-      this.feedbackGain.gain.value = 0.0;
-
-      this.delayTaps = [];
-      const baseDelayTimes = [0.12, 0.24, 0.36, 0.48, 0.60, 0.72, 0.84, 0.96, 1.10, 1.25, 1.40, 1.60, 1.80, 2.00, 2.25, 2.50];
-
-      for (let i = 0; i < 16; i++) {
-        const dNode = this.ctx.createDelay(4.0);
-        dNode.delayTime.value = baseDelayTimes[i];
-
-        const panner = this.ctx.createStereoPanner ? this.ctx.createStereoPanner() : null;
-        if (panner) panner.pan.value = Math.sin(i * 1.5);
-
-        const gNode = this.ctx.createGain();
-        gNode.gain.value = 0.25;
-
-        if (panner) {
-          dNode.connect(panner);
-          panner.connect(gNode);
-        } else {
-          dNode.connect(gNode);
-        }
-
-        gNode.connect(this.filterNode);
-        this.delayTaps.push(dNode);
-      }
-
-      this.filterNode.connect(this.hpFilter);
-      this.hpFilter.connect(this.feedbackGain);
-      this.feedbackGain.connect(this.delayTaps[0]);
-
-      this.filterNode.connect(this.masterGain);
-      this.masterGain.connect(this.analyser);
-      this.analyser.connect(this.ctx.destination);
-
-      this.arpTimer = null;
-    }
-
-    start() {
-      if (this.ctx.state === "suspended") {
-        this.ctx.resume();
-      }
-
-      const chordVoicings = [
-        [146.83, 220.00, 261.63, 329.63, 440.00],
-        [130.81, 196.00, 246.94, 329.63, 392.00],
-        [110.00, 164.81, 220.00, 261.63, 329.63],
-        [174.61, 261.63, 329.63, 392.00, 523.25]
-      ];
-
-      let chordIndex = 0;
-      let noteStep = 0;
-
-      this.arpTimer = setInterval(() => {
-        const chord = chordVoicings[chordIndex];
-        const freq = chord[noteStep % chord.length];
-
-        this.triggerVoice(freq, 0.35);
-
-        noteStep++;
-        if (noteStep % 8 === 0) {
-          chordIndex = (chordIndex + 1) % chordVoicings.length;
-        }
-      }, 260);
-    }
-
-    triggerVoice(freq, dur) {
-      if (!this.ctx) return;
-      const now = this.ctx.currentTime;
-
-      const osc1 = this.ctx.createOscillator();
-      const osc2 = this.ctx.createOscillator();
-      const subOsc = this.ctx.createOscillator();
-      const vEnv = this.ctx.createGain();
-
-      osc1.type = "triangle";
-      osc2.type = "sawtooth";
-      subOsc.type = "sine";
-
-      osc1.frequency.setValueAtTime(freq, now);
-      osc2.frequency.setValueAtTime(freq * 1.004, now);
-      subOsc.frequency.setValueAtTime(freq * 0.5, now);
-
-      const vFilter = this.ctx.createBiquadFilter();
-      vFilter.type = "lowpass";
-      vFilter.frequency.setValueAtTime(1600, now);
-
-      vEnv.gain.setValueAtTime(0.001, now);
-      vEnv.gain.linearRampToValueAtTime(0.35, now + 0.04);
-      vEnv.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-
-      osc1.connect(vFilter);
-      osc2.connect(vFilter);
-      subOsc.connect(vFilter);
-      vFilter.connect(vEnv);
-
-      vEnv.connect(this.delayTaps[0]);
-      vEnv.connect(this.masterGain);
-
-      osc1.start(now);
-      osc2.start(now);
-      subOsc.start(now);
-
-      osc1.stop(now + dur + 0.1);
-      osc2.stop(now + dur + 0.1);
-      subOsc.stop(now + dur + 0.1);
-    }
-
-    getSynthSample() {
-      if (!this.analyser) return 0;
-      this.analyser.getByteTimeDomainData(this.analyserData);
-      let maxDiff = 0;
-      for (let i = 0; i < this.analyserData.length; i++) {
-        const diff = (this.analyserData[i] - 128) / 128;
-        if (Math.abs(diff) > Math.abs(maxDiff)) {
-          maxDiff = diff;
-        }
-      }
-      return maxDiff * 1.5;
-    }
-
-    stop() {
-      clearInterval(this.arpTimer);
-    }
-
-    updateParam(ch, cc, val) {
-      if (!this.ctx) return;
-      const norm = val / 127;
-      const now = this.ctx.currentTime;
-
-      if (ch === 1 && cc === 7) {
-        const gain = (val / 51) * 1.2;
-        this.masterGain.gain.setValueAtTime(gain, now);
-      }
-      if (ch === 1 && cc === 1) this.masterGain.gain.setValueAtTime(norm * 1.0, now);
-      if (ch === 2 && cc === 1) this.feedbackGain.gain.setValueAtTime(norm * 0.88, now);
-      if (ch === 2 && cc === 3) this.hpFilter.frequency.setValueAtTime(norm * 220, now);
-      if (ch === 3 && cc === 1) {
-        const scale = 0.25 + norm * 1.75;
-        this.delayTaps.forEach((t, i) => {
-          t.delayTime.setValueAtTime((0.1 + (i * 0.12)) * scale, now);
-        });
-      }
-      if (ch === 3 && cc === 3) {
-        const hz = 200 * Math.pow(80, norm);
-        this.filterNode.frequency.setValueAtTime(hz, now);
-      }
-
-      this.triggerVoice(330 + (val * 4), 0.12);
-    }
-  }
-
-  btnWebAudio.addEventListener("click", () => {
-    webAudioActive = !webAudioActive;
-    if (webAudioActive) {
-      if (!audioEngine) {
-        audioEngine = new WebAudioSynthSimulation();
-      }
-      audioEngine.start();
-      webAudioStateEl.textContent = "ON";
-      btnWebAudio.classList.remove("btn-secondary");
-      btnWebAudio.classList.add("btn-primary");
-      log("Browser Granular Synth active.", "system");
+  // Draws a normalized [lo, hi) span (hi - lo may be > 0 and lo may be
+  // outside [0,1)) as one or two pixel rectangles, wrapping at the buffer
+  // edges. `paint(x0, x1)` receives pixel coordinates for each piece.
+  function drawWrappedSpan(lo, hi, width, paint) {
+    const length = Math.max(0, hi - lo);
+    const start = wrap01(lo);
+    const end = start + length;
+    if (end <= 1) {
+      paint(start * width, end * width);
     } else {
-      if (audioEngine) audioEngine.stop();
-      webAudioStateEl.textContent = "OFF";
-      btnWebAudio.classList.remove("btn-primary");
-      btnWebAudio.classList.add("btn-secondary");
-      log("Browser Synth stopped.", "system");
+      paint(start * width, width);
+      paint(0, (end - 1) * width);
     }
-  });
+  }
 
-  /**
-   * Single Combined Scope Render Loop with Live Parameter Reactivity
-   */
+  function drawScopeMessage(text) {
+    const width = canvasCssWidth, height = canvasCssHeight;
+    const maxWidth = Math.max(120, width - 32);
+    ctx.fillStyle = theme.muted;
+    ctx.font = "13px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const words = text.split(" ");
+    const lines = [];
+    let line = "";
+    words.forEach((w) => {
+      const test = line ? line + " " + w : w;
+      if (ctx.measureText(test).width > maxWidth && line) {
+        lines.push(line);
+        line = w;
+      } else {
+        line = test;
+      }
+    });
+    if (line) lines.push(line);
+    const lineHeight = 18;
+    const startY = height / 2 - ((lines.length - 1) * lineHeight) / 2;
+    lines.forEach((l, i) => ctx.fillText(l, width / 2, startY + i * lineHeight));
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+  }
+
   function drawScope() {
     const width = canvasCssWidth;
     const height = canvasCssHeight;
     ctx.clearRect(0, 0, width, height);
 
-    // Background Grid
-    ctx.strokeStyle = "#141414";
-    ctx.lineWidth = 1;
-    for (let x = 0; x < width; x += 40) {
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
+    if (!sysexGranted) {
+      drawScopeMessage("The scope needs MIDI SysEx permission. Allow it in the browser's site settings and reload.");
+      requestAnimationFrame(drawScope);
+      return;
     }
-    for (let y = 0; y < height; y += 40) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+    if (!engine.hello) {
+      drawScopeMessage("Waiting for the engine. Start carters_delay_midi.scd, then press Send all values or reload.");
+      requestAnimationFrame(drawScope);
+      return;
     }
 
+    const now = performance.now();
+    const { bufferFrames, sampleRate, numCols } = engine.hello;
     const centerY = height / 2;
-    const bufferStartX = 25;
-    const bufferWidth = Math.max(100, width - 45);
-    const rateMultiplier = (0.25 + (state.grainRate / 127) * 1.75);
 
-    // Axis Labels
-    ctx.fillStyle = "#444444";
-    ctx.font = "9px monospace";
-    ctx.fillText("L", 6, 16);
-    ctx.fillText("CTR", 2, centerY + 3);
-    ctx.fillText("R", 6, height - 8);
-
-    // Baseline axis line
-    ctx.strokeStyle = "#242424";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(bufferStartX, centerY);
-    ctx.lineTo(bufferStartX + bufferWidth, centerY);
-    ctx.stroke();
-
-    // 1. Advance Record Head Pointer (Pauses when Freeze is Active)
-    if (!state.freeze) {
-      recPointer = (recPointer + 0.0025 * rateMultiplier) % 1.0;
-    }
-
-    // 2. Capture Real Bipolar Audio Sample (-1.0 to +1.0)
-    let currentInputSample = 0;
-    if (!state.freeze) {
-      if (micActive) currentInputSample += getMicSample();
-      if (webAudioActive && audioEngine) currentInputSample += audioEngine.getSynthSample();
-    }
-
-    // 3. Continuous Multi-Sample Recording into Ring Buffer
-    const currentWriteIndex = Math.floor(recPointer * bufferLength);
-    const inputLevelNorm = state.delayInMute ? (state.delayInLevel / 127) : 0;
-    const preserveFactor = state.freeze ? 1.0 : (state.preserveLevel / 127) * 0.96;
-
-    if (!state.freeze) {
-      let idx = lastWriteIndex;
-      while (idx !== currentWriteIndex) {
-        audioRingBuffer[idx] = (audioRingBuffer[idx] * preserveFactor) + (currentInputSample * inputLevelNorm);
-        idx = (idx + 1) % bufferLength;
+    // Write head: extrapolate between HEAD packets unless frozen.
+    if (!engine.head.frozen) {
+      const dt = (now - engine.head.lastUpdate) / 1000;
+      if (dt > 0 && sampleRate > 0 && bufferFrames > 0) {
+        engine.head.pos = wrap01(engine.head.pos + (dt * sampleRate) / bufferFrames);
       }
-      audioRingBuffer[currentWriteIndex] = (audioRingBuffer[currentWriteIndex] * preserveFactor) + (currentInputSample * inputLevelNorm);
-      lastWriteIndex = currentWriteIndex;
+      engine.head.lastUpdate = now;
     }
 
-    // 4. Render Recorded Audio Waveform
-    ctx.strokeStyle = state.freeze ? "#cccccc" : "#888888";
-    ctx.lineWidth = state.freeze ? 1.8 : 1.4;
-    ctx.beginPath();
-    for (let i = 0; i < bufferLength; i++) {
-      const x = bufferStartX + (i / bufferLength) * bufferWidth;
-      const val = audioRingBuffer[i];
-      const ampY = centerY - (val * (height / 2 - 16));
-      if (i === 0) ctx.moveTo(x, ampY);
-      else ctx.lineTo(x, ampY);
+    // Waveform: numCols columns from colPeaks. x = 0 is SC buffer frame 0;
+    // the whole canvas width is the whole SC buffer.
+    if (engine.colPeaks && numCols > 0) {
+      const colWidth = width / numCols;
+      const maxBarHalf = height / 2 - 10;
+      ctx.fillStyle = rgba(theme.text, 0.5);
+      for (let i = 0; i < numCols; i++) {
+        const peak = engine.colPeaks[i] || 0;
+        const barHalf = peak > 0 ? Math.max(0.5, peak * maxBarHalf) : 0;
+        if (barHalf <= 0) continue;
+        const x = i * colWidth;
+        ctx.fillRect(x, centerY - barHalf, Math.max(1, colWidth - 0.5), barHalf * 2);
+      }
     }
-    ctx.stroke();
 
-    // Fill subtle translucent area under waveform
-    ctx.fillStyle = state.freeze ? "rgba(255, 255, 255, 0.07)" : "rgba(255, 255, 255, 0.04)";
-    ctx.beginPath();
-    ctx.moveTo(bufferStartX, centerY);
-    for (let i = 0; i < bufferLength; i++) {
-      const x = bufferStartX + (i / bufferLength) * bufferWidth;
-      const val = audioRingBuffer[i];
-      const ampY = centerY - (val * (height / 2 - 16));
-      ctx.lineTo(x, ampY);
-    }
-    ctx.lineTo(bufferStartX + bufferWidth, centerY);
-    ctx.closePath();
-    ctx.fill();
+    // Grains: transient rectangles with playheads, wrapping at the edges.
+    const grainHeight = 11;
+    const maxPanOffsetY = height / 2 - grainHeight / 2 - 6;
+    engine.grains = engine.grains.filter((g) => (now - g.createdAt) < g.durMs);
+    engine.grains.forEach((g) => {
+      const elapsed = now - g.createdAt;
+      const lifeFrac = clamp01(g.durMs > 0 ? elapsed / g.durMs : 1);
+      const dir = g.rate < 0 ? -1 : 1;
+      const extent = sampleRate > 0 && bufferFrames > 0
+        ? clamp01((g.durMs / 1000) * Math.abs(g.rate) * sampleRate / bufferFrames)
+        : 0;
+      const a = g.start;
+      const b = g.start + dir * extent;
+      const lo = Math.min(a, b);
+      const hi = Math.max(a, b);
+      // Pan up = left: negative pan moves the rectangle toward the top.
+      const y = centerY + g.pan * maxPanOffsetY - grainHeight / 2;
+      const ampNorm = clamp01(g.amp / 3);
 
-    // 5. Draw Record Head Line (Dashed when Frozen)
-    const recX = bufferStartX + (recPointer * bufferWidth);
-    ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.5;
-    if (state.freeze) ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(recX, 6);
-    ctx.lineTo(recX, height - 6);
-    ctx.stroke();
-    if (state.freeze) ctx.setLineDash([]);
-
-    ctx.fillStyle = "#ffffff";
-    ctx.font = "9px monospace";
-    ctx.fillText(state.freeze ? "FROZEN" : "REC HEAD", Math.min(bufferWidth - 45, recX + 4), 16);
-
-    // 6. Draw 16 Overlaid Grain Slice Rectangles with Live Interleaved Rates
-    const grainDensScale = 0.2 + (state.grainDens / 127) * 2.8;
-    const sliceHeight = 14;
-    const minDelayOffset = 0.04;
-    const jumbleSpread = (state.jumble / 127) * 0.12;
-    const tap16Rates = get16TapRates();
-
-    const dustFactor = (1 - (state.syncMode / 127));
-
-    taps.forEach((tap, idx) => {
-      // Tap rate directly from the 16-tap additive array
-      const tapRate = tap16Rates[idx] * rateMultiplier;
-      const isReverse = tapRate < 0;
-
-      const jumbleJitter = Math.sin(Date.now() * 0.005 + idx) * jumbleSpread;
-      const effectiveDelay = Math.max(minDelayOffset, tap.delayOffset + jumbleJitter);
-      const sliceStartNorm = (recPointer - effectiveDelay + 1.0) % 1.0;
-
-      const maxAllowedSliceWidth = effectiveDelay * 0.85;
-      const baseSliceWidth = 0.03 + (idx % 4) * 0.015;
-      const sliceWidthNorm = Math.min(maxAllowedSliceWidth, baseSliceWidth * grainDensScale);
-
-      const sliceStartX = bufferStartX + (sliceStartNorm * bufferWidth);
-      const sliceWidthPx = sliceWidthNorm * bufferWidth;
-      let sliceEndX = sliceStartX + sliceWidthPx;
-
-      // Playhead progress: reverse taps scan right-to-left, forward taps scan left-to-right
-      const playheadSpeed = 0.015 * Math.abs(tapRate) * (1 + (Math.random() * 0.3 * dustFactor));
-      if (isReverse) {
-        tap.playheadProgress = (tap.playheadProgress - playheadSpeed + 1.0) % 1.0;
-      } else {
-        tap.playheadProgress = (tap.playheadProgress + playheadSpeed) % 1.0;
-      }
-
-      tap.panPhase += tap.lfoSpeed;
-      tap.pan = Math.sin(tap.panPhase);
-
-      // Advance amplitude LFO (LFNoise1-style: linear interp toward random target)
-      if (Math.abs(tap.ampLfo - tap.ampLfoTarget) < tap.ampLfoRate) {
-        tap.ampLfoTarget = 0.15 + Math.random() * 0.85;
-      }
-      tap.ampLfo += Math.sign(tap.ampLfoTarget - tap.ampLfo) * tap.ampLfoRate;
-
-      const maxPanOffsetY = (height / 2) - 24;
-      const sliceY = (centerY - (tap.pan * maxPanOffsetY)) - (sliceHeight / 2);
-
-      // Reactivity to Filter Cutoff (brightness), Freeze, and per-tap ampLfo (opacity)
-      const cutoffBrightness = Math.round(30 + (state.cutoff / 127) * 35);
-      const tapAlpha = state.delayOutMute ? tap.ampLfo : 0.15;
-      if (state.delayOutMute) {
-        ctx.fillStyle = state.freeze
-          ? `rgba(80, 80, 80, ${(tapAlpha * 0.9).toFixed(2)})`
-          : `rgba(${cutoffBrightness}, ${cutoffBrightness}, ${cutoffBrightness}, ${(tapAlpha * 0.75).toFixed(2)})`;
-        ctx.strokeStyle = state.freeze ? `rgba(255, 255, 255, ${tapAlpha.toFixed(2)})` : (isReverse ? `rgba(224, 224, 224, ${tapAlpha.toFixed(2)})` : `rgba(136, 136, 136, ${tapAlpha.toFixed(2)})`);
-      } else {
-        ctx.fillStyle = "rgba(15, 15, 15, 0.15)";
-        ctx.strokeStyle = "#222222";
-      }
+      ctx.fillStyle = rgba(theme.signal, 0.1 + ampNorm * 0.55);
+      ctx.strokeStyle = rgba(theme.muted, 0.4 + ampNorm * 0.5);
       ctx.lineWidth = 1;
+      drawWrappedSpan(lo, hi, width, (x0, x1) => {
+        ctx.fillRect(x0, y, x1 - x0, grainHeight);
+        ctx.strokeRect(x0, y, x1 - x0, grainHeight);
+      });
 
-      // Reactivity to Window Function (Dashed border if percussive/reverse envelope)
-      if (state.envShape >= 43 && state.envShape < 85) {
-        ctx.setLineDash([4, 2]);
-      } else if (state.envShape >= 85) {
-        ctx.setLineDash([2, 2]);
-      } else {
-        ctx.setLineDash([]);
-      }
-
-      if (sliceEndX <= bufferStartX + bufferWidth) {
-        ctx.fillRect(sliceStartX, sliceY, sliceWidthPx, sliceHeight);
-        ctx.strokeRect(sliceStartX, sliceY, sliceWidthPx, sliceHeight);
-      } else {
-        const firstPartWidth = (bufferStartX + bufferWidth) - sliceStartX;
-        const secondPartWidth = sliceWidthPx - firstPartWidth;
-        ctx.fillRect(sliceStartX, sliceY, firstPartWidth, sliceHeight);
-        ctx.strokeRect(sliceStartX, sliceY, firstPartWidth, sliceHeight);
-        ctx.fillRect(bufferStartX, sliceY, secondPartWidth, sliceHeight);
-        ctx.strokeRect(bufferStartX, sliceY, secondPartWidth, sliceHeight);
-      }
-      ctx.setLineDash([]);
-
-      // Draw Active Grain Playhead Line scanning inside Rectangle
-      if (state.delayOutMute) {
-        const boundedPlayheadX = bufferStartX + ((sliceStartNorm + tap.playheadProgress * sliceWidthNorm) % 1.0) * bufferWidth;
-
-        // Distinct playhead color for reverse taps vs forward taps
-        ctx.strokeStyle = isReverse ? "#aaaaaa" : "#ffffff";
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(boundedPlayheadX, sliceY + 1);
-        ctx.lineTo(boundedPlayheadX, sliceY + sliceHeight - 1);
-        ctx.stroke();
-      }
+      // Playhead: moves from `start` toward the far edge over durMs.
+      const playheadNorm = wrap01(a + dir * extent * lifeFrac);
+      const px = playheadNorm * width;
+      ctx.strokeStyle = theme.signal;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(px, y + 1);
+      ctx.lineTo(px, y + grainHeight - 1);
+      ctx.stroke();
     });
 
-    // 7. Feedback Recirculation Ring (Reactive to Feedback Level CC 1)
-    if (state.fbLevel > 0) {
-      const fbIntensity = state.fbLevel / 127;
-      ctx.strokeStyle = "#555555";
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.arc(width / 2, centerY, (width / 4) * fbIntensity, 0, Math.PI * 2);
-      ctx.stroke();
+    // Write head line, dashed + labelled when frozen.
+    const headX = engine.head.pos * width;
+    ctx.strokeStyle = theme.signal;
+    ctx.lineWidth = 1.5;
+    if (engine.head.frozen) ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(headX, 4);
+    ctx.lineTo(headX, height - 4);
+    ctx.stroke();
+    if (engine.head.frozen) {
       ctx.setLineDash([]);
+      ctx.fillStyle = theme.signal;
+      ctx.font = "9px ui-monospace, monospace";
+      ctx.fillText("Frozen", Math.min(width - 40, headX + 4), 14);
     }
 
     requestAnimationFrame(drawScope);
@@ -1193,7 +1122,10 @@
 
   window.addEventListener("DOMContentLoaded", () => {
     setupUIControls();
+    refreshTheme();
     setupCanvasScaling();
     requestAnimationFrame(drawScope);
+    setInterval(updateEngineStatusUI, 500);
+    setInterval(updateTelemetryLine, 1000);
   });
 })();
