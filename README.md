@@ -473,7 +473,9 @@ no second port to wire up.
 
 1. Open `index.html` in a browser that supports the Web MIDI API (e.g.
    Chrome or Edge), or serve it locally: `python3 -m http.server 8000`, then
-   visit `http://localhost:8000`.
+   visit `http://localhost:8000`. Use Chrome or Edge: some other
+   Chromium-based browsers (Vivaldi, for one) don't deliver the engine's
+   SysEx replies, so the scope stays empty.
 2. Grant MIDI access when prompted. The page also asks for the MIDI
    **SysEx** permission, since the scope needs it; if that's denied, the
    page retries without it and keeps working — controls, echo and the

@@ -119,6 +119,7 @@
   let midiOutput = null;
   let midiInput = null;
   let sysexGranted = true; // optimistic until a fallback proves otherwise
+  let midiState = "pending"; // pending | granted | failed
 
   // DOM Elements
   const statusDotEl = document.getElementById("statusDot");
@@ -295,6 +296,7 @@
 
   async function onMIDISuccess(access) {
     midiAccess = access;
+    midiState = "granted";
     log("WebMIDI access granted.", "system");
     await updateOutputs();
     await updateInputs();
@@ -305,6 +307,7 @@
   }
 
   function onMIDIFailure(err) {
+    midiState = "failed";
     log("WebMIDI access failed: " + err, "alert");
     statusDotEl.className = "indicator offline";
     statusTextEl.textContent = "WebMIDI denied";
@@ -1024,6 +1027,13 @@
     const height = canvasCssHeight;
     ctx.clearRect(0, 0, width, height);
 
+    if (midiState !== "granted") {
+      drawScopeMessage(midiState === "pending"
+        ? "Waiting for MIDI permission. Check for a prompt near the address bar. Chrome or Edge work best."
+        : "This browser blocked MIDI access. Use Chrome or Edge, and allow MIDI with SysEx for this page.");
+      requestAnimationFrame(drawScope);
+      return;
+    }
     if (!sysexGranted) {
       drawScopeMessage("The scope needs MIDI SysEx permission. Allow it in the browser's site settings and reload.");
       requestAnimationFrame(drawScope);
