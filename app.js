@@ -679,7 +679,8 @@
 
   function onGrain(d) {
     if (!engine.hello) return;
-    engine.grains.push({ tap: d.tap, start: d.start, durMs: d.durMs, rate: d.rate, pan: d.pan, amp: d.amp, createdAt: performance.now() });
+    engine.grains.push({ tap: d.tap, start: d.start, durMs: d.durMs, rate: d.rate, pan: d.pan, amp: d.amp,
+      win: MAP.windowIndex(state.window), createdAt: performance.now() });
     if (engine.grains.length > GRAIN_CAP) engine.grains.shift();
     grainCounter++;
   }
@@ -987,6 +988,22 @@
   function wrap01(x) { return ((x % 1) + 1) % 1; }
   function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
+  // SuperCollider Env segment with curvature c, 0..1 progress -> 0..1.
+  function envCurve(x, c) { return (1 - Math.exp(c * x)) / (1 - Math.exp(c)); }
+
+  // The grain window's amplitude at `t` (0..1 through the grain), matching
+  // the engine's envelopes, so a drawn grain fades the way it sounds.
+  function grainEnvelope(win, t) {
+    t = clamp01(t);
+    if (win === 1) { // Env.perc(0.01, 0.99, 1, -4)
+      return clamp01(t < 0.01 ? t / 0.01 : 1 - envCurve((t - 0.01) / 0.99, -4));
+    }
+    if (win === 2) { // Env([0, 1, 0], [0.98, 0.02], [4, -4])
+      return clamp01(t < 0.98 ? envCurve(t / 0.98, 4) : 1 - envCurve((t - 0.98) / 0.02, -4));
+    }
+    return Math.pow(Math.sin(Math.PI * t), 2); // built-in Hann
+  }
+
   // Draws a normalized [lo, hi) span (hi - lo may be > 0 and lo may be
   // outside [0,1)) as one or two pixel rectangles, wrapping at the buffer
   // edges. `paint(x0, x1)` receives pixel coordinates for each piece.
@@ -1098,9 +1115,10 @@
       // Pan up = left: negative pan moves the rectangle toward the top.
       const y = centerY + g.pan * maxPanOffsetY - grainHeight / 2;
       const ampNorm = clamp01(g.amp / 3);
+      const env = grainEnvelope(g.win, lifeFrac);
 
-      ctx.fillStyle = rgba(theme.signal, 0.1 + ampNorm * 0.55);
-      ctx.strokeStyle = rgba(theme.muted, 0.4 + ampNorm * 0.5);
+      ctx.fillStyle = rgba(theme.signal, (0.1 + ampNorm * 0.55) * env);
+      ctx.strokeStyle = rgba(theme.muted, (0.4 + ampNorm * 0.5) * env);
       ctx.lineWidth = 1;
       drawWrappedSpan(lo, hi, width, (x0, x1) => {
         ctx.fillRect(x0, y, x1 - x0, grainHeight);
@@ -1110,7 +1128,7 @@
       // Playhead: moves from `start` toward the far edge over durMs.
       const playheadNorm = wrap01(a + dir * extent * lifeFrac);
       const px = playheadNorm * width;
-      ctx.strokeStyle = theme.signal;
+      ctx.strokeStyle = rgba(theme.signal, env);
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(px, y + 1);
