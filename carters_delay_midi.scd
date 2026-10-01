@@ -30,8 +30,9 @@
      CC | Name                | Mapping                                                  | Default v | Default value
      ---|---------------------|----------------------------------------------------------|-----------|---------------
      1  | Feedback Level      | v/127                                                     | 0         | 0
-     2  | Feedback Balance    | v<=64: (v-64)/64 ; v>64: (v-64)/63  -> -1..+1              | 64        | 0.0 exactly
-     3  | Feedback High-Pass  | v/127 * 220 Hz                                            | 7         | 12.13 Hz
+     2  | Feedback Balance    | v<=64: (v-64)/64 ; v>64: (v-64)/63  -> -1..+1 (which output | 64        | 0.0 exactly
+        |                     | channel feeds back: -1 left only, +1 right only, 0 both)   |           |
+     3  | Feedback High-Pass  | v/127 * 220 Hz, never below 5 Hz (v = 0..2 give 5 Hz)      | 7         | 12.13 Hz
      4  | Pink Noise Level    | v/127                                                     | 0         | 0
      5  | Sine Level          | v/127                                                     | 0         | 0
      6  | Sine Frequency      | note = round(20 + v*70/127); Hz = 440*2^((note-69)/12)     | 24        | note 33 = 55.00 Hz
@@ -648,12 +649,13 @@ handleCC = { |chan, num, val, quiet = false|
 		{ num == 8 } {
 			freezeOn = if (val > 0) { 1 } { 0 };
 			if (freezeOn > 0) {
-				ptrSynth.set(\rate, 0);
-				recSynth.run(false);
+				// One bundle, so the recorder never runs for a callback at a
+				// pointer that has already stopped (it would pile input onto
+				// one sample).
+				s.makeBundle(nil, { ptrSynth.set(\rate, 0); recSynth.run(false) });
 				post.(" -> Buffer Freeze: FROZEN");
 			} {
-				ptrSynth.set(\rate, 1);
-				recSynth.run(true);
+				s.makeBundle(nil, { ptrSynth.set(\rate, 1); recSynth.run(true) });
 				post.(" -> Buffer Freeze: LIVE");
 			};
 			echoCC.(2, 8, freezeOn * 127);
@@ -1554,10 +1556,17 @@ s.waitForBoot({
 			arg in = 0, out = 0, amp = 0, balance = 0, hpFreq = 12,
 			noiseLevel = 0.0, sineLevel = 0, sineHz = 55;
 			var input = InFeedback.ar(in, 2);
-			var output = Balance2.ar(input[0], input[1], balance);
+			// Balance2 returns a stereo pair; the delay input bus is mono, so
+			// sum it (a 2-channel Out onto the 1-channel micBus would spill
+			// the right channel onto the next bus -- the write pointer).
+			// `balance` therefore weights left vs right output into the mono
+			// feedback: -1 = left channel only, +1 = right channel only.
+			var output = Balance2.ar(input[0], input[1], balance).sum;
 			output = output + (PinkNoise.ar * noiseLevel);
 			output = output + (SinOsc.ar(sineHz) * sineLevel);
-			output = HPF.ar(output, hpFreq);
+			// Never run HPF at 0 Hz: its state then integrates without bound
+			// and is released as a burst when the cutoff is raised again.
+			output = HPF.ar(output, hpFreq.max(5));
 			output = output.softclip;
 			Out.ar(out, output * amp);
 		}).add;

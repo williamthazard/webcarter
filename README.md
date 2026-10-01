@@ -69,8 +69,8 @@ extra: a minimal frontend can send controls and stop there.
 | CC | Name | Mapping | Default v | Default value |
 |----|------|---------|-----------|---------------|
 | 1 | Feedback Level | `v / 127` | 0 | 0 |
-| 2 | Feedback Balance | v ≤ 64: `(v−64)/64`; v > 64: `(v−64)/63` → −1..+1 | 64 | 0.0 exactly |
-| 3 | Feedback High-Pass | `v/127 × 220` Hz | 7 | 12.13 Hz |
+| 2 | Feedback Balance | v ≤ 64: `(v−64)/64`; v > 64: `(v−64)/63` → −1..+1. Which output channel feeds back into the (mono) delay input: −1 left only, +1 right only, 0 both equally | 64 | 0.0 exactly |
+| 3 | Feedback High-Pass | `v/127 × 220` Hz, never below 5 Hz (v = 0..2 all give 5 Hz, so the filter's state stays bounded) | 7 | 12.13 Hz |
 | 4 | Pink Noise Level | `v / 127` | 0 | 0 |
 | 5 | Sine Level | `v / 127` | 0 | 0 |
 | 6 | Sine Frequency | note = `round(20 + v·70/127)`; Hz = `440·2^((note−69)/12)` (SC `.midicps`) | 24 | note 33 = 55.00 Hz |
