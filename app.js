@@ -4,10 +4,10 @@
  * This is a reference WebMIDI frontend for carters_delay_midi.scd. It is a
  * CC-only control contract (MAP and CONTROLS below mirror the engine's MIDI
  * contract exactly — see README.md / the .scd header) plus a bidirectional
- * layer (BIDI_SPEC): the engine echoes every control it applies on channels
- * 9-11, replies to a state request on Ch 16 CC 1, and streams scope
- * telemetry over SysEx (F0 7D 43 ...). The buffer scope below is drawn
- * purely from that telemetry — there is no local audio simulation.
+ * layer (README, "Listening to the engine"): the engine echoes every control
+ * it applies on channels 9-11, replies to a state request on Ch 16 CC 1, and
+ * streams scope telemetry over SysEx (F0 7D 43 ...). The buffer scope below
+ * is drawn purely from that telemetry — there is no local audio simulation.
  */
 
 (function () {
@@ -100,8 +100,8 @@
   const CONTROLS_BY_KEY = {};
   CONTROLS.forEach((c) => { CONTROLS_BY_KEY[c.key] = c; });
 
-  // Echo lookup: BIDI_SPEC §2 — "Find the CONTROLS entry by (echo channel −
-  // 8, cc)." Keyed by the control's own (1-based) channel and CC.
+  // Echo lookup (README, "Channel map": echo channel = control channel + 8).
+  // Keyed by the control's own (1-based) channel and CC.
   const CONTROLS_BY_CHCC = {};
   CONTROLS.forEach((c) => { CONTROLS_BY_CHCC[c.ch + ":" + c.cc] = c; });
 
@@ -119,7 +119,7 @@
   let midiOutput = null;
   let midiInput = null;
   let sysexGranted = true; // optimistic until a fallback proves otherwise
-  let midiState = "pending"; // pending | granted | failed
+  let midiState = "pending"; // pending | granted | failed | unsupported | insecure
 
   // DOM Elements
   const statusDotEl = document.getElementById("statusDot");
@@ -155,31 +155,39 @@
     }
   }
 
+  // Returns how many controls were restored. Only well-typed values are
+  // accepted: a finite number for a slider (clamped to an integer 0..127)
+  // and a real boolean for a toggle or chip. Anything else is ignored.
   function applySavedState(saved) {
-    if (!saved || typeof saved !== "object" || !saved.state || typeof saved.state !== "object") return;
+    if (!saved || typeof saved !== "object" || !saved.state || typeof saved.state !== "object") return 0;
     const savedState = saved.state;
+    let applied = 0;
     CONTROLS.forEach((c) => {
       if (!(c.key in savedState)) return; // unknown/missing keys are ignored
       const raw = savedState[c.key];
       if (c.kind === "slider") {
-        let n = Number(raw);
-        if (!Number.isFinite(n)) return;
-        n = Math.max(0, Math.min(127, Math.round(n))); // clamped to integers 0..127
-        state[c.key] = n;
+        if (typeof raw !== "number" || !Number.isFinite(raw)) return;
+        state[c.key] = Math.max(0, Math.min(127, Math.round(raw)));
       } else {
-        state[c.key] = Boolean(raw); // booleans are coerced
+        if (typeof raw !== "boolean") return;
+        state[c.key] = raw;
       }
+      applied++;
     });
+    return applied;
   }
 
   function saveSettings() {
     try {
       const savedState = {};
       CONTROLS.forEach((c) => { savedState[c.key] = state[c.key]; });
+      // A port that isn't selected right now (permission pending, no
+      // devices, or the input not chosen yet during startup) keeps its
+      // previously saved name instead of being overwritten with null.
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
         state: savedState,
-        midiOutputName: midiOutput ? midiOutput.name : null,
-        midiInputName: midiInput ? midiInput.name : null,
+        midiOutputName: midiOutput ? midiOutput.name : getSavedOutputName(),
+        midiInputName: midiInput ? midiInput.name : getSavedInputName(),
       }));
     } catch (e) {
       console.warn("Could not save settings:", e);
@@ -199,7 +207,7 @@
     return raw && typeof raw.midiInputName === "string" ? raw.midiInputName : null;
   }
 
-  applySavedState(readSettingsRaw());
+  const restoredCount = applySavedState(readSettingsRaw());
 
   // ---------------------------------------------------------------------
   // Canvas HiDPI Scaling setup
@@ -270,9 +278,17 @@
   // ---------------------------------------------------------------------
   async function initMIDI() {
     if (!navigator.requestMIDIAccess) {
-      log("navigator.requestMIDIAccess is not supported in this browser.", "alert");
+      // Web MIDI only exists on secure pages (https, localhost, file://), so
+      // on a plain http:// page it's missing even in Chrome or Edge. A
+      // browser with no Web MIDI at all looks the same there, so the
+      // insecure-page message also names the browsers that have it.
+      const insecure = window.isSecureContext === false;
+      midiState = insecure ? "insecure" : "unsupported";
+      log(insecure
+        ? "navigator.requestMIDIAccess is unavailable because this page isn't a secure context (or this browser has no Web MIDI)."
+        : "navigator.requestMIDIAccess is not supported in this browser.", "alert");
       statusDotEl.className = "indicator offline";
-      statusTextEl.textContent = "WebMIDI unsupported";
+      statusTextEl.textContent = insecure ? "WebMIDI needs a secure page" : "WebMIDI unsupported";
       return;
     }
     try {
@@ -314,6 +330,20 @@
     statusTextEl.textContent = "WebMIDI denied";
   }
 
+  // Fallback port choice when nothing is selected or saved: the first name
+  // containing "IAC", else "loopMIDI", else "Bus 1" as a whole word (so
+  // "Bus 10" doesn't count). Each rule is tried across every port before
+  // the next rule, so list order only breaks ties within one rule.
+  const PORT_NAME_PREFERENCE = [/IAC/, /loopMIDI/, /\bBus 1\b/];
+
+  function preferredPort(ports) {
+    for (const re of PORT_NAME_PREFERENCE) {
+      const match = ports.find((p) => re.test(p.name));
+      if (match) return match;
+    }
+    return null;
+  }
+
   async function updateOutputs() {
     if (!midiAccess) return;
     const outputs = Array.from(midiAccess.outputs.values());
@@ -326,6 +356,7 @@
       midiOutputSelect.appendChild(opt);
       const hadOutput = !!midiOutput;
       midiOutput = null;
+      resetRequestPairing();
       statusDotEl.className = "indicator offline";
       statusTextEl.textContent = "No devices";
       if (hadOutput) log("Selected output: none (no devices connected)", "system");
@@ -342,13 +373,13 @@
     // Keep the current selection if it still exists.
     let chosen = midiOutput ? outputs.find((o) => o.id === midiOutput.id) || null : null;
 
-    // Otherwise fall back, in order: saved name -> IAC/Bus 1/loopMIDI -> first output.
+    // Otherwise fall back, in order: saved name -> IAC, loopMIDI, Bus 1 -> first output.
     if (!chosen) {
       const savedName = getSavedOutputName();
       if (savedName) chosen = outputs.find((o) => o.name === savedName) || null;
     }
     if (!chosen) {
-      chosen = outputs.find((o) => /IAC|Bus 1|loopMIDI/.test(o.name)) || null;
+      chosen = preferredPort(outputs);
     }
     if (!chosen) {
       chosen = outputs[0];
@@ -383,9 +414,11 @@
     maybeSendRequestState();
   });
 
-  // The "Replies from" input select (BIDI_SPEC §5). By default it pairs
-  // with the selected output's name, else the first name containing IAC,
-  // Bus 1 or loopMIDI. Only the selected input gets an onmidimessage handler.
+  // The "Replies from" input select (README, "Run the web demo"). By default
+  // it uses the saved name, else pairs with the selected output's name, else
+  // follows preferredPort (IAC, loopMIDI, Bus 1), else the first input.
+  // Changing the output later doesn't change it. Only the selected input
+  // gets an onmidimessage handler.
   function attachInputHandler(input) {
     if (midiInput && midiInput !== input) {
       try { midiInput.onmidimessage = null; } catch (e) { /* ignore */ }
@@ -407,6 +440,7 @@
       const hadInput = !!midiInput;
       if (midiInput) { try { midiInput.onmidimessage = null; } catch (e) { /* ignore */ } }
       midiInput = null;
+      resetRequestPairing();
       if (hadInput) log("Replies from: none (no input connected)", "system");
       return;
     }
@@ -428,7 +462,7 @@
       chosen = inputs.find((i) => i.name === midiOutput.name) || null;
     }
     if (!chosen) {
-      chosen = inputs.find((i) => /IAC|Bus 1|loopMIDI/.test(i.name)) || null;
+      chosen = preferredPort(inputs);
     }
     if (!chosen) {
       chosen = inputs[0];
@@ -458,21 +492,170 @@
     maybeSendRequestState();
   });
 
-  // Sends the request BF 01 7F once both the output and the input are
-  // selected, and again whenever either changes (BIDI_SPEC §2/§5).
-  let lastRequestPairKey = null;
-  function maybeSendRequestState() {
-    if (!midiOutput || !midiInput) return;
-    const key = midiOutput.id + "|" + midiInput.id;
-    if (key === lastRequestPairKey) return;
-    lastRequestPairKey = key;
-    const bytes = [0xBF, 1, 127];
+  // ---------------------------------------------------------------------
+  // State request BF 01 7F (README, "Echo": "When to ask"). Sent once both
+  // the output and the input are selected, and again whenever either
+  // changes. A request that fails to send is retried at the next port
+  // change. A sent request with no HELLO after 1.5 s is re-sent (the engine
+  // can miss it while it is booting). It is also re-sent when an echo
+  // arrives before any HELLO, at most once every 2 s. Neither re-send
+  // happens while the engine's own SysEx (F0 7D 43 ...) has arrived in the
+  // last 2 s: that proves the engine is alive and its HELLO is only queued
+  // behind telemetry the MIDI port is still delivering, and another request
+  // would just queue a second reply. The 1.5 s check then looks again 1.5 s
+  // later instead of re-sending, but for no longer than 6 s after the
+  // request: if telemetry is still arriving with no HELLO by then, the HELLO
+  // was lost, so the request is re-sent anyway. Both kinds of re-send share
+  // one budget of 3 attempts per output/input pairing, which a HELLO or a
+  // pairing change resets. An echo-triggered re-send replaces the pending
+  // 1.5 s check with its own, timed from that re-send and deferring the same
+  // way (6 s at most), so the two kinds can't re-send back to back and a
+  // lost HELLO after an echo-triggered re-send is still recovered.
+  // "Send all values" also ends with a request; that one is manual and
+  // outside the budget.
+  // A "reply" is a HELLO; without SysEx permission HELLO can't reach the
+  // page, so there any echo after the request counts as the reply.
+  // ---------------------------------------------------------------------
+  const REQUEST_BYTES = [0xBF, 1, 127];
+  const REQUEST_RETRY_MS = 1500;
+  const REQUEST_MAX_ATTEMPTS = 3;
+  const ECHO_REREQUEST_MS = 2000;
+  const SYSEX_ALIVE_MS = 2000;
+  const REQUEST_DEFER_MAX_MS = 6000; // the 1.5 s check waits on arriving SysEx at most this long
+
+  let lastRequestPairKey = null; // pairing whose request went out successfully
+  let requestAttempts = 0; // attempts for the current pairing since its last HELLO
+  let requestRetryTimer = null;
+  let lastRequestAttemptAt = -Infinity; // any request, successful or not
+  let lastHelloAt = -Infinity;
+  let lastEchoAt = -Infinity;
+  let lastSysexAt = -Infinity; // any F0 7D 43 packet
+
+  function currentPairKey() {
+    return midiOutput && midiInput ? midiOutput.id + "|" + midiInput.id : null;
+  }
+
+  function replyArrivedSince(t) {
+    return lastHelloAt >= t || (!sysexGranted && lastEchoAt >= t);
+  }
+
+  // Forget the current pairing's request, so the next time both ports are
+  // selected the request goes out again (even for the same two ports).
+  function resetRequestPairing() {
+    lastRequestPairKey = null;
+    requestAttempts = 0;
+    clearTimeout(requestRetryTimer);
+    requestRetryTimer = null;
+  }
+
+  // A HELLO answers every request made so far: the budget starts over.
+  function onRequestAnswered() {
+    requestAttempts = 0;
+    clearTimeout(requestRetryTimer);
+    requestRetryTimer = null;
+  }
+
+  // Sends BF 01 7F once and logs it. Returns the send time, or null if
+  // nothing was sent (no output, or send() threw).
+  function sendStateRequest(note) {
+    const desc = `${bytesHex(REQUEST_BYTES)}  Requesting engine state (Ch 16 CC 1 = 127)${note ? " " + note : ""}`;
+    lastRequestAttemptAt = Date.now();
+    if (!midiOutput) {
+      log(desc + " — not sent (no MIDI output)", "system");
+      return null;
+    }
     try {
-      midiOutput.send(bytes);
-      log(`${bytesHex(bytes)}  Requesting engine state (Ch 16 CC 1 = 127)`, "system");
+      midiOutput.send(REQUEST_BYTES);
     } catch (err) {
       log("MIDI send failed: " + (err && err.message ? err.message : err), "alert");
+      return null;
     }
+    log(desc, "system");
+    return lastRequestAttemptAt;
+  }
+
+  // One attempt for the current pairing, plus the retry check behind it.
+  function requestForPairing(key, reason = "no reply yet") {
+    requestAttempts++;
+    const note = requestAttempts > 1 ? `(${reason}, attempt ${requestAttempts} of ${REQUEST_MAX_ATTEMPTS})` : "";
+    const sentAt = sendStateRequest(note);
+    if (sentAt === null) {
+      // Not sent: forget the pairing so a later port change or statechange
+      // tries again from the first attempt.
+      resetRequestPairing();
+      return;
+    }
+    lastRequestPairKey = key;
+    armRequestRetry(key, sentAt);
+  }
+
+  // The 1.5 s check behind a sent request. While the engine's own SysEx is
+  // arriving it re-arms instead of re-sending (the reply is queued, not
+  // lost), without using up an attempt; but once 6 s have passed since the
+  // request with no HELLO, the HELLO is taken as lost and the request is
+  // re-sent anyway (that does use up an attempt).
+  function armRequestRetry(key, sentAt, delay = REQUEST_RETRY_MS) {
+    clearTimeout(requestRetryTimer);
+    requestRetryTimer = setTimeout(() => {
+      requestRetryTimer = null;
+      if (currentPairKey() !== key || lastRequestPairKey !== key) return; // pairing changed meanwhile
+      if (replyArrivedSince(sentAt)) return;
+      if (requestAttempts >= REQUEST_MAX_ATTEMPTS) return; // the engine's boot HELLO will still arrive
+      const now = Date.now();
+      if (now - lastSysexAt < SYSEX_ALIVE_MS) {
+        const waited = now - sentAt;
+        if (waited < REQUEST_DEFER_MAX_MS) {
+          // alive; HELLO is just queued. Look again in 1.5 s, or at the 6 s mark if sooner.
+          armRequestRetry(key, sentAt, Math.min(REQUEST_RETRY_MS, REQUEST_DEFER_MAX_MS - waited));
+          return;
+        }
+        requestForPairing(key, `telemetry arriving but no HELLO ${REQUEST_DEFER_MAX_MS / 1000} s after the request`);
+        return;
+      }
+      requestForPairing(key);
+    }, delay);
+  }
+
+  function maybeSendRequestState() {
+    const key = currentPairKey();
+    if (!key) {
+      resetRequestPairing();
+      return;
+    }
+    if (key === lastRequestPairKey) return;
+    resetRequestPairing();
+    requestForPairing(key);
+  }
+
+  // An echo arrived but no HELLO has: the engine is there and the page may
+  // have missed its HELLO, so ask again — throttled to once every 2 s,
+  // skipped while the engine's own SysEx is arriving (same rule as the
+  // 1.5 s check), and counted against the pairing's budget of 3 attempts.
+  // Once sent, it is checked like any other request: it gets its own 1.5 s
+  // check, which defers while the engine's SysEx arrives and re-sends at
+  // the 6 s mark, so a lost HELLO after it is still recovered.
+  function maybeRerequestOnEcho() {
+    if (engine.hello || !sysexGranted || !midiOutput) return;
+    const key = currentPairKey();
+    if (!key) return;
+    const now = Date.now();
+    if (now - lastSysexAt < SYSEX_ALIVE_MS) return; // alive; HELLO is just queued
+    if (now - lastRequestAttemptAt < ECHO_REREQUEST_MS) return;
+    if (requestAttempts >= REQUEST_MAX_ATTEMPTS) return;
+    requestAttempts++;
+    const sentAt = sendStateRequest(`(echo arrived before HELLO, attempt ${requestAttempts} of ${REQUEST_MAX_ATTEMPTS})`);
+    // Sent: a pending 1.5 s check would re-send right behind this request,
+    // so armRequestRetry replaces it with the check for this one. Not sent:
+    // the attempt still counts, no check is left pending, and the next port
+    // change tries again from the first attempt.
+    if (sentAt === null) {
+      clearTimeout(requestRetryTimer);
+      requestRetryTimer = null;
+      lastRequestPairKey = null;
+      return;
+    }
+    lastRequestPairKey = key;
+    armRequestRetry(key, sentAt);
   }
 
   // ---------------------------------------------------------------------
@@ -510,8 +693,17 @@
   }
 
   // Tracks the last time each control was actually sent, for the echo
-  // drag/keyboard guard's "300 ms after a local send" half (BIDI_SPEC §2).
+  // guard's "300 ms after a local send" half (README, "Recommended page
+  // behaviour"), and the echoes the guard dropped, for re-applying the
+  // latest one when it ends.
+  const ECHO_GUARD_MS = 300;
   const lastSentAt = {};
+  const droppedEchoes = {}; // control key -> latest echo dropped by the guard { ch, cc, val }
+  const guardTimers = {}; // control key -> timeout that ends the 300 ms half of the guard
+
+  // The shared chip readout's "Last sent" message: the last chip message
+  // this page actually sent, or null before any chip message went out.
+  let lastChipMessageHex = null;
 
   function sendCC(c, v) {
     let val = Math.round(Number(v));
@@ -523,17 +715,28 @@
     const msgClass = "ch" + c.ch + "-msg";
     const readoutId = bytesReadoutIdFor(c);
     const desc = hex + "  Ch " + c.ch + " CC " + c.cc + " = " + val + " (" + c.label + " " + c.format(val) + ")";
+    // Nothing went out: a control's own readout shows its message at rest;
+    // the chips' shared "Last sent" readout keeps what was really sent.
+    const showAtRest = () => {
+      if (c.kind === "chip") updateIntervalBytesAtRest();
+      else setBytesReadoutText(readoutId, hex);
+    };
 
     if (midiOutput) {
       try {
         // send() opens the output implicitly if it isn't already open.
         midiOutput.send(bytes);
         lastSentAt[c.key] = Date.now();
+        // An echo dropped before this send describes an engine state this
+        // send has already replaced, so it must not be re-applied later.
+        delete droppedEchoes[c.key];
+        armGuardTimer(c.key, ECHO_GUARD_MS);
+        if (c.kind === "chip") lastChipMessageHex = hex;
         log(desc, msgClass);
         flashBytesReadout(readoutId, hex);
       } catch (err) {
         log("MIDI send failed: " + (err && err.message ? err.message : err), "alert");
-        setBytesReadoutText(readoutId, hex);
+        showAtRest();
       }
     } else {
       // No output connected: the byte readout still shows the message for
@@ -541,7 +744,7 @@
       // this neither triggers the "sent" flash nor logs as if it reached
       // the engine — the log line says explicitly that it was dropped.
       log(desc + " — not sent (no MIDI output)", msgClass);
-      setBytesReadoutText(readoutId, hex);
+      showAtRest();
     }
 
     return val;
@@ -565,8 +768,11 @@
   });
 
   // ---------------------------------------------------------------------
-  // SysEx decoders (BIDI_SPEC §4) — one place, so every packet type is
-  // decoded consistently. Every packet is F0 7D 43 <type> <payload…> F7.
+  // SysEx decoders (README, "SysEx telemetry") — one place, so every packet
+  // type is decoded consistently. Every packet is F0 7D 43 <type>
+  // <payload…> F7. The engine sends packets in bursts, so one incoming
+  // message may hold several packets back to back: split it with
+  // SYSEX.frames, then decode each frame.
   // ---------------------------------------------------------------------
   function u14(p, o) { return (p[o] << 7) | p[o + 1]; }
   function u21(p, o) { return (p[o] << 14) | (p[o + 1] << 7) | p[o + 2]; }
@@ -575,6 +781,22 @@
   const SYSEX_TYPE = { HELLO: 0x01, HEAD: 0x02, GRAIN: 0x03, COLUMN: 0x04, DUMP: 0x05 };
 
   const SYSEX = {
+    // Every complete F0 … F7 frame in `data`, in order. A frame cut short
+    // by a new F0, or by the end of the data, is dropped.
+    frames(data) {
+      const out = [];
+      let start = -1;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i] === 0xF0) {
+          start = i;
+        } else if (data[i] === 0xF7 && start >= 0) {
+          out.push(data.subarray ? data.subarray(start, i + 1) : Array.prototype.slice.call(data, start, i + 1));
+          start = -1;
+        }
+      }
+      return out;
+    },
+    // Decodes one frame (F0 … F7); null if it isn't one of ours or is malformed.
     decode(data) {
       if (!data || data.length < 5) return null;
       if (data[0] !== 0xF0 || data[1] !== 0x7D || data[2] !== 0x43) return null;
@@ -639,7 +861,7 @@
 
   // ---------------------------------------------------------------------
   // Engine telemetry state — mutated only by message handlers, drawn only
-  // by requestAnimationFrame (BIDI_SPEC §5, "Rendering").
+  // by requestAnimationFrame (README, "SysEx telemetry").
   // ---------------------------------------------------------------------
   const engine = {
     hello: null, // { version, bufferFrames, sampleRate, numCols, numTaps }
@@ -657,7 +879,13 @@
     return (sec >= 10 ? Math.round(sec) : sec.toFixed(1)) + " s";
   }
 
+  // Every HELLO resets the scope (README, "SysEx telemetry"). It is logged
+  // as "Engine started" only when it's the first one or the buffer's shape
+  // changed; the boot's second HELLO and each request reply's HELLO are
+  // "Engine state reset".
   function onHello(d) {
+    const prev = engine.hello;
+    const started = !prev || prev.bufferFrames !== d.bufferFrames || prev.sampleRate !== d.sampleRate || prev.numCols !== d.numCols;
     engine.hello = { version: d.version, bufferFrames: d.bufferFrames, sampleRate: d.sampleRate, numCols: d.numCols, numTaps: d.numTaps };
     engine.colPeaks = new Float32Array(Math.max(1, d.numCols));
     engine.grains = [];
@@ -666,7 +894,7 @@
       const spanSec = d.sampleRate > 0 ? d.bufferFrames / d.sampleRate : 0;
       scopeSpanLabelEl.textContent = `${formatSpan(spanSec)} buffer`;
     }
-    log("Engine started", "system");
+    log(started ? "Engine started" : "Engine state reset", "system");
   }
 
   function onHead(d) {
@@ -712,22 +940,29 @@
   // ---------------------------------------------------------------------
   // Incoming MIDI: echo (Ch 9-11 CC) and SysEx telemetry only. The page
   // ignores everything else, including its own looped-back Ch 1-3/16
-  // messages (BIDI_SPEC §1 "Loop safety").
+  // messages (README, "Loop safety").
   // ---------------------------------------------------------------------
   function onMIDIMessage(e) {
     const data = e.data;
     if (!data || data.length === 0) return;
 
     if (data[0] === 0xF0) {
-      const decoded = SYSEX.decode(data);
-      if (!decoded) return; // not one of ours, or malformed
-      lastEngineActivity = Date.now();
-      handleTelemetryPacket(decoded);
+      SYSEX.frames(data).forEach((frame) => {
+        const decoded = SYSEX.decode(frame);
+        if (!decoded) return; // not one of ours, or malformed
+        lastEngineActivity = lastSysexAt = Date.now();
+        if (decoded.type === "hello") {
+          lastHelloAt = lastEngineActivity;
+          onRequestAnswered();
+        }
+        handleTelemetryPacket(decoded);
+      });
       return;
     }
 
     const status = data[0];
     if ((status & 0xF0) !== 0xB0) return; // only Control Change matters here
+    if (data.length < 3) return; // truncated CC: nothing to read
     const chan0 = status & 0x0F; // 0-based MIDI channel
     const cc = data[1];
     const val = data[2];
@@ -735,7 +970,9 @@
     if (chan0 >= 8 && chan0 <= 10) {
       // Echo channels 9-11 (0-based 8-10): the same CC SC just applied.
       lastEngineActivity = Date.now();
+      lastEchoAt = lastEngineActivity;
       handleEcho(chan0 - 8 + 1, cc, val);
+      maybeRerequestOnEcho();
       return;
     }
 
@@ -756,44 +993,108 @@
     return false;
   }
 
+  // The guard (README, "Recommended page behaviour"): a control is guarded
+  // while the user is dragging/keying it and for 300 ms after the page last
+  // sent it.
+  function isGuarded(key) {
+    return isInteracting(key) || (Date.now() - (lastSentAt[key] || 0)) < ECHO_GUARD_MS;
+  }
+
+  // The value an echo sets, in the same 0..127 terms the page sends.
+  function echoValueFor(c, val) {
+    if (c.kind === "slider") return Math.max(0, Math.min(127, Math.round(Number(val)) || 0));
+    return val > 0 ? 127 : 0;
+  }
+
+  function armGuardTimer(key, ms) {
+    clearTimeout(guardTimers[key]);
+    guardTimers[key] = setTimeout(() => {
+      delete guardTimers[key];
+      releaseGuard(key);
+    }, ms);
+  }
+
+  // Called whenever part of the guard may have ended (pointer/key release,
+  // blur, tab hidden, or the 300 ms timer). Once the control is no longer
+  // guarded, the latest echo dropped while it was guarded is applied unless
+  // the control already shows that value (normally because it is the echo
+  // of the page's own last send). This catches e.g. a boot bang or another
+  // frontend's change that landed mid-drag.
+  function releaseGuard(key) {
+    const pending = droppedEchoes[key];
+    if (!pending) return;
+    if (isInteracting(key)) return; // its own release will call this again
+    const remaining = ECHO_GUARD_MS - (Date.now() - (lastSentAt[key] || 0));
+    if (remaining > 0) {
+      armGuardTimer(key, remaining);
+      return;
+    }
+    delete droppedEchoes[key];
+    const c = CONTROLS_BY_KEY[key];
+    const shown = c.kind === "slider" ? state[key] : (state[key] ? 127 : 0);
+    if (echoValueFor(c, pending.val) === shown) return;
+    applyEcho(c, pending.ch, pending.cc, pending.val, " (applied after interaction)");
+  }
+
   function handleEcho(ch, cc, val) {
     const c = CONTROLS_BY_CHCC[ch + ":" + cc];
     if (!c) return; // unlisted CC on an echo channel; ignore silently
 
-    const interacting = isInteracting(c.key);
-    const recentlySent = (Date.now() - (lastSentAt[c.key] || 0)) < 300;
-    if (interacting || recentlySent) return; // BIDI_SPEC §2 drag/keyboard + 300ms guard
+    if (isGuarded(c.key)) {
+      // Don't fight the interaction now; keep the latest echo so it can be
+      // applied once the guard ends (releaseGuard).
+      droppedEchoes[c.key] = { ch, cc, val };
+      return;
+    }
+    // Unguarded: this echo is newer than any dropped earlier for the
+    // control, so that one must never be applied after it.
+    delete droppedEchoes[c.key];
+    applyEcho(c, ch, cc, val, "");
+  }
 
-    let appliedValue;
+  function applyEcho(c, ch, cc, val, note) {
+    const appliedValue = echoValueFor(c, val);
     if (c.kind === "slider") {
-      appliedValue = Math.max(0, Math.min(127, Math.round(Number(val)) || 0));
       state[c.key] = appliedValue;
       updateSliderUI(c, appliedValue);
+      setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, appliedValue)));
     } else {
-      const on = val > 0;
+      const on = appliedValue > 0;
       state[c.key] = on;
-      appliedValue = on ? 127 : 0;
       if (c.kind === "chip") {
         updateChipUI(c, on);
         updateIntervalStatusText();
+        // The shared chip readout is "Last sent": an echo must not put a
+        // message there that this page never sent.
+        updateIntervalBytesAtRest();
       } else {
         updateToggleUI(c, on);
+        setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, appliedValue)));
       }
     }
-    setBytesReadoutText(bytesReadoutIdFor(c), bytesHex(bytesForControl(c, appliedValue)));
     saveSettings(); // never sends MIDI in response — this only updates local state/UI/storage
 
     const echoStatus = 0xB0 | ((ch - 1) + 8);
-    log(`${bytesHex([echoStatus, cc, val])} echo Ch ${ch} CC ${cc}`, "system");
+    log(`${bytesHex([echoStatus, cc, val])} echo Ch ${ch} CC ${cc}${note}`, "system");
   }
 
   // ---------------------------------------------------------------------
   // Engine status (heartbeat) and telemetry rate line
   // ---------------------------------------------------------------------
+  // With SysEx, HEAD (about 5 a second) is the heartbeat. Without it only
+  // echoes can arrive, so liveness is keyed on echoes and says so.
   function updateEngineStatusUI() {
-    const alive = (Date.now() - lastEngineActivity) < 2000;
+    const now = Date.now();
+    let alive, text;
+    if (sysexGranted) {
+      alive = (now - lastEngineActivity) < 2000;
+      text = alive ? "Engine running" : "No reply from the engine";
+    } else {
+      alive = (now - lastEchoAt) < 2000;
+      text = alive ? "Engine replying (no SysEx)" : "No reply from the engine";
+    }
     if (engineDotEl) engineDotEl.className = "indicator " + (alive ? "online" : "offline");
-    if (engineStatusTextEl) engineStatusTextEl.textContent = alive ? "Engine running" : "No reply from the engine";
+    if (engineStatusTextEl) engineStatusTextEl.textContent = text;
   }
 
   function updateTelemetryLine() {
@@ -843,10 +1144,15 @@
     statusEl.textContent = names.length > 0 ? names.join(" + ") : "Base intervals";
   }
 
-  // Shows the shared "last sent" interval byte readout at rest (before
-  // anything has actually been sent this session): the first toggle that's
-  // on, or Octaves (CC9) as a representative default.
+  // Shows the shared "Last sent" interval byte readout at rest: the last
+  // chip message this page sent, or, before any chip was pressed this
+  // session, the message for the first chip that's on (Octaves CC9 as a
+  // representative default when none is).
   function updateIntervalBytesAtRest() {
+    if (lastChipMessageHex) {
+      setBytesReadoutText("ctl_intervals-bytes", lastChipMessageHex);
+      return;
+    }
     const onKey = INTERVAL_KEYS.find((k) => state[k]);
     const c = CONTROLS_BY_KEY[onKey || "octavesOn"];
     const v = state[c.key] ? 127 : 0;
@@ -892,8 +1198,8 @@
           setControlValue(c, c.def);
           log(`Reset ${c.label} to default (${c.def}).`, "system");
         });
-        // Drag/keyboard guard (BIDI_SPEC §2): ignore echoes for a control
-        // while the user is actively interacting with it.
+        // Drag/keyboard guard (README, "Recommended page behaviour"):
+        // ignore echoes for a control while the user is interacting with it.
         el.addEventListener("pointerdown", (e) => {
           // A fresh press can't overlap a drag already in progress on this
           // same control, so any entry still claiming it is stale (its
@@ -902,8 +1208,8 @@
           pointerOwners.set(e.pointerId, c.key);
         });
         el.addEventListener("keydown", () => keyboardActive.add(c.key));
-        el.addEventListener("keyup", () => keyboardActive.delete(c.key));
-        el.addEventListener("blur", () => keyboardActive.delete(c.key));
+        el.addEventListener("keyup", () => { keyboardActive.delete(c.key); releaseGuard(c.key); });
+        el.addEventListener("blur", () => { keyboardActive.delete(c.key); releaseGuard(c.key); });
       } else if (c.kind === "chip") {
         const el = document.getElementById(c.id);
         if (!el) {
@@ -927,11 +1233,19 @@
 
   // Release a pointer's drag guard wherever the pointer lifts, since
   // pointerup can land outside the element that started the drag.
-  window.addEventListener("pointerup", (e) => pointerOwners.delete(e.pointerId));
-  window.addEventListener("pointercancel", (e) => pointerOwners.delete(e.pointerId));
+  function releasePointer(e) {
+    const key = pointerOwners.get(e.pointerId);
+    pointerOwners.delete(e.pointerId);
+    if (key) releaseGuard(key);
+  }
+  window.addEventListener("pointerup", releasePointer);
+  window.addEventListener("pointercancel", releasePointer);
   // A tab hidden mid-drag often never delivers the pointerup/keyup.
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) { pointerOwners.clear(); keyboardActive.clear(); }
+    if (!document.hidden) return;
+    pointerOwners.clear();
+    keyboardActive.clear();
+    Object.keys(droppedEchoes).forEach(releaseGuard);
   });
 
   function restoreControlsFromState() {
@@ -953,12 +1267,15 @@
   function setupUIControls() {
     wireControls();
 
+    // A manual resync: pushes every value, then asks for the engine's state
+    // (BF 01 7F), so pressing it also brings up the scope if HELLO was missed.
     btnSendAll.addEventListener("click", () => {
       log("Sending all values…", "system");
       CONTROLS.forEach((c) => {
         const v = c.kind === "slider" ? state[c.key] : (state[c.key] ? 127 : 0);
         sendCC(c, v);
       });
+      sendStateRequest("");
     });
 
     btnPanic.addEventListener("click", () => {
@@ -976,13 +1293,16 @@
     });
 
     restoreControlsFromState();
-    if (readSettingsRaw()) {
-      log('Restored settings from previous session (localStorage). Use "Send all values" once your MIDI output is connected to sync the engine.', "system");
+    // The engine is the source of truth once it replies: its reply to the
+    // request (or its boot bang) replaces these restored values.
+    if (restoredCount > 0) {
+      log("Showing last session's values until the engine reports its state.", "system");
     }
   }
 
   // ---------------------------------------------------------------------
-  // Buffer scope — drawn purely from engine telemetry (BIDI_SPEC §5).
+  // Buffer scope — drawn purely from engine telemetry (README, "SysEx
+  // telemetry").
   // Message handlers above only mutate `engine`; only this function draws.
   // ---------------------------------------------------------------------
   function wrap01(x) { return ((x % 1) + 1) % 1; }
@@ -1054,7 +1374,11 @@
     if (midiState !== "granted") {
       drawScopeMessage(midiState === "pending"
         ? "Waiting for MIDI permission. Check for a prompt near the address bar. Chrome or Edge work best."
-        : "This browser blocked MIDI access. Use Chrome or Edge, and allow MIDI with SysEx for this page.");
+        : midiState === "insecure"
+          ? "Web MIDI needs a secure page: open it from localhost, a file:// path, or https. (Chrome or Edge required.)"
+          : midiState === "unsupported"
+            ? "This browser has no Web MIDI. Use Chrome or Edge."
+            : "This browser blocked MIDI access. Use Chrome or Edge, and allow MIDI with SysEx for this page.");
       requestAnimationFrame(drawScope);
       return;
     }
@@ -1064,7 +1388,7 @@
       return;
     }
     if (!engine.hello) {
-      drawScopeMessage("Waiting for the engine. Start carters_delay_midi.scd, then press Send all values or reload.");
+      drawScopeMessage("Waiting for the engine. Start carters_delay_midi.scd; the scope appears when it replies. If it's already running, press Send all values.");
       requestAnimationFrame(drawScope);
       return;
     }
