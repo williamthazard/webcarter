@@ -268,13 +268,11 @@ Everything in this section shares the **same MIDI port** as the control
 contract above — there's no second cable. Grain telemetry is the largest
 and most variable part of what the engine sends: 14 bytes per grain, about
 7–20 grains a second at defaults (~100–280 B/s), and up to ~260 a second
-at max density and min rate (about 3,700 B/s in all). On macOS, over the
-IAC bus, the engine reports essentially every grain, even at the top of
-that range. On Linux and Windows it has to use SuperCollider's SysEx call,
-whose speed there hasn't been measured, so it plays safe: it hands the
-port at most about 600 B/s of SysEx apart from request replies. That is
-enough for essentially every grain at defaults but no more than about 35
-a second; it keeps the newest and drops the rest. On every platform it
+at max density and min rate (about 3,700 B/s in all). The engine sends
+SysEx through SuperCollider's SysEx call on every platform, and plays
+safe: it hands the port at most about 600 B/s of SysEx apart from request
+replies. That is enough for essentially every grain at defaults but no
+more than about 35 a second; it keeps the newest and drops the rest. It
 reports none while the port is falling behind. HEAD adds a steady ~40 B/s
 (about 5 packets a second) and COLUMN about 32 B/s (47 B/s at 96 kHz), so
 the total at defaults is about 170–350 B/s. A request reply adds 1,084
@@ -444,7 +442,7 @@ numbers are packed MSB-first into that many 7-bit bytes:
 |---|---|---|---|
 | `0x01` | HELLO | `version` u7 (=1), `bufferFrames` u28, `sampleRate` u21, `numCols` u14, `numTaps` u7 (=16) | Twice at boot: once the buffer exists (before the bang), and again once the engine is listening; also the first SysEx frame of each request reply, though the burst carrying it may start with COLUMN frames queued just before (see [Echo](#echo-what-it-means-and-when-it-happens)) |
 | `0x02` | HEAD | `writeHead` pos14, `frozen` u7 (`0`/`1`) | Measured 20 times a second, but only the newest HEAD in each ~200 ms burst is sent, so about 5 a second, however busy the port is; also in a request reply |
-| `0x03` | GRAIN | `tap` u7, `start` pos14, `durMs` u14, `rate` u14 (`round(rate·2048+8192)`, signed range −4 to just under +4: +4 encodes as `16383` → +3.9995), `pan` u7 (`round((pan+1)/2·127)`), `amp` u7 (`round(clip(amp,0,3)/3·127)`) | Per grain trigger — about 7–20 a second at defaults, up to ~260 at max density. On macOS essentially all are reported; on Linux and Windows at most about 35 a second (more are thinned — see "Byte budget" below). None while the port is falling behind (see "Latency" below), or in the bursts that carry a request reply |
+| `0x03` | GRAIN | `tap` u7, `start` pos14, `durMs` u14, `rate` u14 (`round(rate·2048+8192)`, signed range −4 to just under +4: +4 encodes as `16383` → +3.9995), `pan` u7 (`round((pan+1)/2·127)`), `amp` u7 (`round(clip(amp,0,3)/3·127)`) | Per grain trigger — about 7–20 a second at defaults, up to ~260 at max density. Essentially all are reported at defaults, at most about 35 a second (more are thinned, newest kept — see "Byte budget" below). None while the port is falling behind (see "Latency" below), or in the bursts that carry a request reply |
 | `0x04` | COLUMN | `col` u14, `peak` u7 (`round(clip(peak,0,1)·127)`) | Whenever the write head leaves a waveform column: `numCols` per pass of the write head round the buffer, so about 4 a second at the default 1024 columns over a 256 s buffer (about 5.9 at 96 kHz); skipped while the engine hears that the port is more than 1 s behind, or has stopped hearing its HEADs come back (see "Latency" below) |
 | `0x05` | DUMP | `startCol` u14, `count` u14 (≤ 256), then `count` peak `u7` bytes, each encoded like COLUMN's `peak` | Request reply: the whole recorded-peaks array, in chunks of up to 256 columns, one chunk per burst; a chunk not yet sent waits while the engine hears that the port is more than 1 s behind, or has stopped hearing its HEADs come back, and a request arriving then gets no DUMP |
 
@@ -468,22 +466,19 @@ packets are delivered in bursts of up to ~200 ms. How a burst is handed to
 the MIDI driver depends on the platform; the bytes are the same on all of
 them:
 
-- **macOS:** as a run of ordinary MIDI packets of up to 3 bytes each
-  (`MIDIOut.write`, which goes through CoreMIDI's `MIDISend`). SysEx may
-  span any number of MIDI packets; CoreMIDI delivers them at once and
-  reassembles the SysEx. SuperCollider's SysEx call (`MIDIOut.sysex`)
-  goes through CoreMIDI's `MIDISendSysex` instead, which paces SysEx to
-  roughly MIDI-cable speed (about 3,000 B/s measured on the IAC bus),
-  below the engine's peak of about 3,700 B/s; `MIDISend` packets go out
-  at once (over 3,300 B/s sustained on the IAC bus, with no backlog).
-- **Linux:** the whole burst in one `MIDIOut.sysex` call.
+- **macOS and Linux:** the whole burst in one `MIDIOut.sysex` call. On
+  macOS that goes through CoreMIDI's `MIDISendSysex`, which delivers SysEx
+  at roughly MIDI-cable speed (about 3,000 B/s measured on the IAC bus),
+  well above the byte budget below.
 - **Windows:** one `MIDIOut.sysex` call per packet, since PortMidi sends a
   SysEx buffer only up to its first `F7`.
 
-(On Linux and Windows `MIDIOut.write` sends only short messages, so it
-can't carry SysEx there.) Depending on the platform and the receiving MIDI
-API, a burst arrives as one SysEx message or as several (on Windows, one
-per packet), so a message may contain several packets back to back
+The engine never sends SysEx through `MIDIOut.write`, though on macOS it
+is faster: it is for short messages only, and SysEx bytes sent through it
+turn into fake status bytes (stray notes and CCs, broken frames) at the
+receiver. Depending on the platform and the receiving MIDI API, a burst
+arrives as one SysEx message or as several (on Windows, one per packet),
+so a message may contain several packets back to back
 (`F0 7D 43 … F7 F0 7D 43 … F7 …`). Split every incoming SysEx message
 into its `F0 … F7` frames and decode each one; each packet's bytes are
 exactly as in the tables above. Only the newest HEAD in each burst is kept
@@ -497,12 +492,11 @@ packets of one SysEx message; a missed DUMP chunk is filled in by the
 COLUMN stream or the next request.
 
 Such a message can even land inside a single frame. A frame can cross the
-bus in pieces — on macOS the engine hands each burst over 3 bytes at a
-time, and a driver may split a long frame (a 265-byte DUMP chunk, say) —
-and a CC sent on the same bus meanwhile, by a second frontend or by your
-own page (a slider move, a request) looped back, can land between them.
-Under the MIDI spec any status byte other than a real-time one ends a
-SysEx message, so a receiver may lose that frame. The engine never resends
+bus in pieces — a driver may split a long frame (a 265-byte DUMP chunk,
+say) — and a CC sent on the same bus meanwhile, by a second frontend or by
+your own page (a slider move, a request) looped back, can land between
+them. Under the MIDI spec any status byte other than a real-time one ends
+a SysEx message, so a receiver may lose that frame. The engine never resends
 a packet, so don't depend on any single one: a lost HEAD is replaced by the
 next, a lost GRAIN or COLUMN is simply missing, a lost DUMP chunk leaves its
 columns empty until the write head passes them again (COLUMN) or another
@@ -516,39 +510,25 @@ Send all values.
 **Byte budget.** SysEx can be slow to deliver, and anything handed over
 faster than the MIDI driver delivers it backs up inside the operating
 system, where the engine can't see it. So each burst has a byte budget,
-set by how fast the platform's send path is. HELLO, HEAD and COLUMN are
-counted first and go out whatever the budget (COLUMN apart from the
-backlog gate below); GRAIN packets (14 bytes each) fill whatever budget is
-left, newest first, and the older ones are dropped ("thinned"). The budget
-is per 200 ms: a burst that goes out late (the engine's timer woke late)
-gets a budget in proportion to the time since the previous burst, up to
-three times as much, so a late burst doesn't thin grains the port could
-have carried.
+the same on every platform. HELLO, HEAD and COLUMN are counted first and
+go out whatever the budget (COLUMN apart from the backlog gate below);
+GRAIN packets (14 bytes each) fill whatever budget is left, newest first,
+and the older ones are dropped ("thinned"). The budget is per 200 ms: a
+burst that goes out late (the engine's timer woke late) gets a budget in
+proportion to the time since the previous burst, up to three times as
+much, so a late burst doesn't thin grains the port could have carried.
 
-- **macOS: 800 bytes per burst, about 4,000 B/s.** The packet path (see
-  "Delivery in bursts") sustained about 3,300 B/s on the IAC bus for 20 s
-  and delivered all of it, each burst's HEAD arriving within about 10–40 ms.
-  The budget is above the most the taps can produce, so it's only a safety
-  net: in practice every grain is reported. Only near the top of the
-  density range (over ~250 grains a second with periodic triggers, the
-  default; from about 200 with random ones — see
-  [Trigger distribution](#trigger-distribution-ch3-cc5)) can a burst
-  exceed what fits (56 grains next to its HEAD and a COLUMN), and then a
-  few grains are thinned. That's on a bus the engine hears itself on,
-  such as IAC. On a port that doesn't loop back, the engine estimates the
-  delay instead (see "Latency" below), and above about 220 grains a
-  second the estimate now and then holds grains back.
-- **Linux and Windows: 120 bytes per burst, about 600 B/s.** There the
-  engine has to use SuperCollider's SysEx call, and its speed on ALSA and
-  loopMIDI hasn't been measured, so the budget is a conservative estimate
-  for that path, not a measured limit. Next to the burst's HEAD (8 bytes)
-  and its COLUMN, if any (8 bytes), that leaves room for 7 grains per
-  burst (8 when there's no COLUMN), so at most about 35 a second are
-  reported. Grains don't arrive evenly — the 16 taps'
-  periodic triggers line up now and then — so thinning starts well below
-  that: even at defaults a burst occasionally catches more grains than
-  fit, and a few percent are dropped; about 10% are dropped at 30 grains a
-  second, and 30% at 50.
+**The budget is 120 bytes per burst, about 600 B/s, on every platform.**
+That's well under what SuperCollider's SysEx call delivers on macOS (see
+"Delivery in bursts"); its speed on ALSA and loopMIDI hasn't been
+measured, so there the budget is a conservative estimate, not a measured
+limit. Next to the burst's HEAD (8 bytes) and its COLUMN, if any (8
+bytes), that leaves room for 7 grains per burst (8 when there's no
+COLUMN), so at most about 35 a second are reported. Grains don't arrive
+evenly — the 16 taps' periodic triggers line up now and then — so
+thinning starts well below that: even at defaults a burst occasionally
+catches more grains than fit, and a few percent are dropped; about 10%
+are dropped at 30 grains a second, and 30% at 50.
 
 A request reply doesn't go out in one lump either: after its echoes, HELLO
 and HEAD go out in the next burst, then one DUMP chunk (265 bytes) per
@@ -566,10 +546,7 @@ number dropped:
 Telemetry: thinning grain packets (N dropped in the last 10 s)
 ```
 
-On macOS it should never appear at defaults; if it appears at all, it's
-only near the top of the density range (over ~250 grains a second with
-periodic triggers, from about 200 with random ones). On Linux and Windows
-it can appear a few times a minute: at high density, but at defaults
+It can appear a few times a minute: at high density, but at defaults
 too, with a small N.
 
 **Latency.** The engine measures how far behind the port is rather than
@@ -584,16 +561,13 @@ of being sent, are taken as lost. While the buffer is frozen all HEADs
 look alike, so a lost one is recognised after 2 s and the measurement
 re-anchored: a lost HEAD skews the measurement for about 2 s at most.
 
-While the port is more than 0.5 s behind on macOS (0.35 s on Linux and
-Windows), bursts carry no GRAIN packets; they resume once it's back under
-0.3 s (0.25 s on Linux and Windows). On macOS's packet path the port is
-normally only a few tens of milliseconds behind, so on a bus the engine
-hears itself on (IAC) this happens only if something is actually wrong.
-While it's more than 1 s behind, bursts carry no COLUMN packets either
-(the waveform catches up from later COLUMNs or the next request's DUMP), a
-reply's DUMP chunk not yet sent waits, and a request arriving then gets no
-DUMP (see [Echo](#echo-what-it-means-and-when-it-happens)). HELLO and HEAD
-always go out.
+While the port is more than 0.35 s behind, bursts carry no GRAIN packets;
+they resume once it's back under 0.25 s. While it's more than 1 s behind,
+bursts carry no COLUMN packets either (the waveform catches up from later
+COLUMNs or the next request's DUMP), a reply's DUMP chunk not yet sent
+waits, and a request arriving then gets no DUMP (see
+[Echo](#echo-what-it-means-and-when-it-happens)). HELLO and HEAD always go
+out.
 
 If HEADs it is still sending stop coming back — none for more than 2 s —
 after the engine has heard some, it doesn't switch to an estimate, which
@@ -624,11 +598,10 @@ back, as in some Linux setups; before its first HEAD returns; after giving
 up as above; or while no HEAD it sent 1–2 s ago is still on its way,
 because it has stopped sending them (the server stopped answering) or has
 only just started again — it estimates the delay instead. It charges each
-burst a fixed cost plus a cost per byte: 10 ms plus 0.3 ms per byte on
-macOS, and 60 ms plus 1 ms per byte on Linux and Windows (estimates, not
-measured on those platforms). The estimate runs down again whenever bursts
-take less time to send than the time between them (200 ms), as on Linux
-and Windows every burst within its normal 120-byte budget does; a late
+burst a fixed cost plus a cost per byte: 60 ms plus 1 ms per byte, on
+every platform (an estimate, not a measurement). The estimate runs down
+again whenever bursts take less time to send than the time between them
+(200 ms), as every burst within its normal 120-byte budget does; a late
 burst, with its larger budget (see "Byte budget"), is charged as if it had
 gone out over the time it covers (up to 400 ms), so a late wake alone
 doesn't make the estimate hold grains back. A burst carrying a reply's
@@ -647,9 +620,9 @@ delay in milliseconds:
 Telemetry: MIDI port is behind by N ms; skipping grain packets
 ```
 
-(The macOS costs come from measurements on the IAC bus. ALSA and loopMIDI
-weren't measured, so on Linux and Windows the estimate is only a rough
-guard.)
+(On macOS these costs are conservative next to the roughly 3,000 B/s
+CoreMIDI's SysEx call delivers on the IAC bus. ALSA and loopMIDI weren't
+measured, so on Linux and Windows the estimate is only a rough guard.)
 
 **Buffer length.** `bufferFrames` is the engine's real buffer length: the
 buffer is 256 s at 44.1/48 kHz; shorter above 65 kHz. The engine allocates
@@ -897,11 +870,10 @@ no second port to wire up.
    the waveform is the engine's own recorded peaks, the write head is the
    engine's actual play/record position (dashed and marked "Frozen" when you
    freeze the buffer), and each reported grain draws a short-lived
-   rectangle at its real position, duration, pan and amplitude (on macOS
-   essentially every grain; on Linux and Windows essentially every one at
-   defaults, and the newest ones when the engine thins them; none while the
-   MIDI port is falling behind — see "Byte budget" and "Latency" under
-   [SysEx telemetry](#sysex-telemetry)). The canvas's
+   rectangle at its real position, duration, pan and amplitude (essentially
+   every grain at defaults, and the newest ones when the engine thins them;
+   none while the MIDI port is falling behind — see "Byte budget" and
+   "Latency" under [SysEx telemetry](#sysex-telemetry)). The canvas's
    full width is always the engine's real buffer length — there's nothing
    to configure. Until the engine's HELLO packet arrives, it shows a waiting
    message instead: "Waiting for the engine. Start carters_delay_midi.scd;
@@ -916,9 +888,9 @@ no second port to wire up.
 ## Tech stack
 
 - **Audio engine:** SuperCollider. `MIDIdef.cc` for control input; `MIDIOut`
-  for echoes and the SysEx telemetry (`MIDIOut.write` in 3-byte packets on
-  macOS, `MIDIOut.sysex` on Linux and Windows); its own HEAD packets, heard
-  back on its MIDI input, to time the port; `SendReply` + `OSCdef` for the
+  for echoes and the SysEx telemetry (`MIDIOut.sysex` on every platform);
+  its own HEAD packets, heard back on its MIDI input, to time the port;
+  `SendReply` + `OSCdef` for the
   server-to-language telemetry that becomes SysEx (write head, waveform
   columns, grain triggers); `GrainBuf` for granulation; `MoogFF` for the
   per-tap low-pass; `EnvGen`/`Env.asr` for synth envelopes; `CoinGate`,

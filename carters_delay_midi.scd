@@ -113,22 +113,17 @@
        README.md, "Listening to the engine", for the exact byte layout of
        every packet type.
      - SysEx goes out in bursts: packets are queued and sent every 200 ms,
-       back to back. How a burst reaches the MIDI layer depends on the
-       platform (see sendSysexBytes):
-         macOS:   as MIDIOut.write packets of up to 3 bytes each (CoreMIDI's
-                  MIDISend), not MIDIOut.sysex. SysEx may span any number
-                  of packets and CoreMIDI reassembles it. MIDIOut.sysex
-                  calls MIDISendSysex, which paces sends to roughly
-                  MIDI-cable speed (~3 KB/s measured here), below the
-                  engine's ~3.7 KB/s peak; MIDISend packets are immediate
-                  (> 3.3 KB/s sustained with no backlog: 20 s on the IAC
-                  bus, every frame delivered, HEADs 10-40 ms behind).
-         Linux:   the whole burst in one MIDIOut.sysex call.
-         Windows: one MIDIOut.sysex call per packet (PortMidi sends a
-                  sysex buffer only up to its first F7).
-       (On Linux and Windows MIDIOut.write sends only short messages, so
-       it can't carry SysEx there.) HEAD is sampled 20 times a second, but
-       only the latest HEAD in each burst is sent (about 5 a second). Echo
+       back to back, always through MIDIOut.sysex (see sendSysexBytes):
+         macOS, Linux: the whole burst in one call. On macOS that is
+                       CoreMIDI's MIDISendSysex, which delivers roughly
+                       MIDI-cable speed (~3,000 B/s measured here).
+         Windows:      one call per packet (PortMidi sends a sysex buffer
+                       only up to its first F7).
+       Never MIDIOut.write, though it is faster on macOS: it is for short
+       messages only, and SysEx bytes sent through it turn into fake
+       status bytes (stray notes/CCs, broken frames) at the receiver.
+       HEAD is sampled 20 times a second, but only the latest HEAD in each
+       burst is sent (about 5 a second). Echo
        CCs are never queued, so SysEx can arrive after echoes sent later --
        don't rely on the relative order of CCs and SysEx. Depending on the
        platform and the receiving MIDI API, packets arrive as separate
@@ -136,12 +131,10 @@
        accept more than one F0 ... F7 frame per block.
      - Byte budget: anything handed over faster than the driver delivers
        it backs up inside the OS, where no queue here can see it, so each
-       burst has a byte budget. On macOS it is 800 bytes (about 4,000 B/s,
-       above the most the taps can produce -- about 3.7 KB/s at maximum
-       density -- so there it is only a safety net and in practice every
-       grain is reported). On Linux and Windows it is 120 bytes (about
-       600 B/s), a conservative estimate for the SysEx path (not measured
-       on those platforms). The budget is per 200 ms of real time since
+       burst has a byte budget: 120 bytes (about 600 B/s) on every
+       platform, a conservative estimate for the SysEx path (well under
+       the ~3,000 B/s measured on macOS; not measured on Linux or
+       Windows). The budget is per 200 ms of real time since
        the previous burst: a burst that goes out late because the flush
        routine woke late (the interpreter was busy, say) gets
        proportionally more, up to 3 times as much, so a late wake doesn't
@@ -150,16 +143,14 @@
        200 ms later, never at once to catch up. HELLO, HEAD and COLUMN
        always go out and are counted first (COLUMN apart from the backlog
        gate below); GRAIN packets fill whatever budget is left, newest
-       first, and the older ones are dropped ("thinned"). On Linux and
-       Windows that leaves room for 7 grains per burst next to a HEAD and
-       a COLUMN, so at most about 35 a second are reported; at defaults
-       (7-20 grains a second) all but a few percent are (dropped when the
-       taps' triggers line up). While grains are being thinned the post
-       window shows "Telemetry: thinning grain packets (N dropped in the
-       last 10 s)", at most once every 10 s: on macOS only near the very
-       top of the density range, never at defaults; on Linux and Windows
-       now and then, at defaults too. Never for the burst in which all 16
-       taps fire together as the engine starts.
+       first, and the older ones are dropped ("thinned"). That leaves room
+       for 7 grains per burst next to a HEAD and a COLUMN, so at most about
+       35 a second are reported; at defaults (7-20 grains a second) all but
+       a few percent are (dropped when the taps' triggers line up). While
+       grains are being thinned the post window shows "Telemetry: thinning
+       grain packets (N dropped in the last 10 s)", at most once every
+       10 s: now and then, at defaults too. Never for the burst in which
+       all 16 taps fire together as the engine starts.
      - Backlog gate (a closed loop): the engine listens on every MIDI
        input, so on a bus that loops back (IAC, loopMIDI) it hears its own
        SysEx. It notes when it sends each HEAD; when that HEAD comes back,
@@ -171,11 +162,9 @@
        the engine first takes it as delay, and if 2 s after that HEAD was
        sent the arrivals still fit it having been lost, takes it as lost
        -- so a lost HEAD skews the measurement for about 2 s at most. While
-       the port is more than 0.5 s behind on macOS (0.35 s on Linux and
-       Windows), bursts carry no GRAINs, until it is back under 0.3 s
-       (0.25 s) -- on macOS's packet path the port is normally 10-40 ms
-       behind, so there this only happens if something is actually wrong.
-       While it is more than 1 s behind, bursts carry no COLUMNs either
+       the port is more than 0.35 s behind, bursts carry no GRAINs, until
+       it is back under 0.25 s. While it is more than 1 s behind, bursts
+       carry no COLUMNs either
        (the waveform catches up from later COLUMNs or the next request's
        DUMP), a request reply leaves out its DUMP, and a reply's DUMP chunk
        not yet sent waits. HELLO and HEAD always go out. Once HEADs have
@@ -197,11 +186,10 @@
        above, and while no HEAD it sent 1-2 s ago is still on its way (it
        has stopped sending them -- the server stopped answering -- or has
        only just started again). The estimate: each burst costs a fixed
-       time plus a time per byte -- 10 ms + 0.3 ms per byte on macOS (the
-       packet path), 60 ms + 1 ms per byte on Linux and Windows (estimates,
-       not measured on those platforms) -- and it runs down again whenever
-       a burst takes less than the 200 ms between bursts, as on Linux and
-       Windows every burst within the budget does. A late burst's larger
+       time plus a time per byte -- 60 ms + 1 ms per byte on every
+       platform (an estimate, not measured) -- and it runs down again
+       whenever a burst takes less than the 200 ms between bursts, as
+       every burst within the budget does. A late burst's larger
        budget is charged over the time it covers (as if the burst had
        started when that time began, up to 400 ms earlier), so a late wake
        alone doesn't hold grains back. A burst carrying a reply's DUMP
@@ -267,26 +255,26 @@ var echoCC, sendHello, sendBang, sendHeadPacket, reportAll;
 var handleHeadOSC, handleColOSC, handleGranOSC;
 var lastReportTime; // Main.elapsedTime of the last request reply (nil = none yet)
 // Outgoing SysEx: queue, byte budget, backlog gate and request-reply
-// spreading (see queueSysex, portBacklog and flushSysex below). How a
-// burst reaches the MIDI layer, and so the budget, the gate thresholds and
-// the fallback model's costs, depend on the platform (see sendSysexBytes):
-// macOS sends through MIDIOut.write packets (fast); Linux and Windows
-// through MIDIOut.sysex (slower: one call per burst on Linux, one per
-// packet on Windows, where PortMidi sends a sysex buffer only up to its
-// first F7).
+// spreading (see queueSysex, portBacklog and flushSysex below). Every
+// burst reaches the MIDI layer through MIDIOut.sysex (see sendSysexBytes):
+// one call per burst, except on Windows, one call per packet, because
+// PortMidi sends a sysex buffer only up to its first F7.
+// NEVER send SysEx through MIDIOut.write, however much faster it is: it
+// reassembles each 3-byte chunk as a short message, so a data byte in a
+// chunk's first position becomes a fake status byte (0x40..0x7F ->
+// note/CC/...), and receivers see random controls and broken frames
+// (verified on the IAC bus with a raw CoreMIDI listener).
 var sysexPlatform = thisProcess.platform.name;
-var sysexViaWrite = (sysexPlatform == \osx);
 var sysexOnePacketPerCall = (sysexPlatform == \windows);
 var sysexQueue = List.new, sysexFlushRoutine;
 var queueSysex, flushSysex, sendSysexBytes, headKey, sysexSendFailed = false;
 var sysexFlushInterval = 0.2; // seconds between bursts, on every platform
-// Bytes per burst: 800 on macOS (about 4,000 B/s, a safety net above the
-// ~3.7 KB/s the taps produce at most), 120 elsewhere (about 600 B/s, a
-// conservative estimate for the SysEx path, not measured on those
-// platforms). Per sysexFlushInterval of real time since the previous
-// burst: a burst that goes out late gets proportionally more, up to 3
-// times (see flushSysex).
-var sysexBudgetBytes = if (sysexViaWrite) { 800 } { 120 };
+// Bytes per burst: 120 (about 600 B/s), a conservative estimate for the
+// SysEx path (MIDISendSysex on macOS was measured at ~3 KB/s; ALSA and
+// loopMIDI weren't measured). Per sysexFlushInterval of real time since
+// the previous burst: a burst that goes out late gets proportionally
+// more, up to 3 times (see flushSysex).
+var sysexBudgetBytes = 120;
 var lastFlushAt; // Main.elapsedTime of the previous flushSysex call (nil before the first)
 var stallMinSecs = 0.3; // a flush this much later than due counts as a language stall, not port delay
 var stallOffset = 0; // language-stall time to subtract from every in-flight HEAD's age (see flushSysex)
@@ -295,13 +283,11 @@ var maxQueuedGrains = 500, queuedGrains = 0, cappedGrains = 0;
 var grainBurstSeen = false; // the first burst with GRAINs (all 16 taps at once) is never "thinning"
 var thinningSince, thinnedBursts = 0, grainsDropped = 0; // the 10 s thinning log
 // The backlog gate (see portBacklog and flushSysex): no GRAINs above
-// gateCloseSecs until back under gateOpenSecs -- 0.5 / 0.3 s on macOS,
-// whose packet path is normally only 10-40 ms behind, 0.35 / 0.25 s
-// elsewhere. Above farBehindSecs, measured on a bus that loops back, and
-// while a loop that was heard has gone quiet (see portFarBehind): no
-// COLUMNs, no reply DUMP.
-var gateCloseSecs = if (sysexViaWrite) { 0.5 } { 0.35 };
-var gateOpenSecs = if (sysexViaWrite) { 0.3 } { 0.25 };
+// gateCloseSecs until back under gateOpenSecs. Above farBehindSecs,
+// measured on a bus that loops back, and while a loop that was heard has
+// gone quiet (see portFarBehind): no COLUMNs, no reply DUMP.
+var gateCloseSecs = 0.35;
+var gateOpenSecs = 0.25;
 var farBehindSecs = 1.0;
 var grainsHeld = false, lastBehindLineAt; // gate state; the 10 s "behind" log
 // The "stopped echoing" log (see flushSysex): posted once each time a loop
@@ -326,13 +312,13 @@ var loopTimeoutSecs = 2.0, quietGiveUpSecs = 8.0, quietSince;
 // Fallback model, used whenever there is nothing to measure (see
 // portBacklog): the time (Main.elapsedTime) by which the port should have
 // delivered everything handed over, charged per burst: a fixed cost plus
-// a cost per byte. macOS (the packet path): 10 ms + 0.3 ms/B; Linux and
-// Windows: 60 ms + 1 ms/B, estimates (see portBacklog). A burst carrying
-// a reply's DUMP chunk is charged the fixed cost only; a late burst with
-// a larger budget is charged over the time it covers (see flushSysex).
+// a cost per byte: 60 ms + 1 ms/B, an estimate (see portBacklog). A burst
+// carrying a reply's DUMP chunk is charged the fixed cost only; a late
+// burst with a larger budget is charged over the time it covers (see
+// flushSysex).
 var sysexBusyUntil = 0;
-var modelBurstSecs = if (sysexViaWrite) { 0.01 } { 0.06 };
-var modelByteSecs = if (sysexViaWrite) { 0.0003 } { 0.001 };
+var modelBurstSecs = 0.06;
+var modelByteSecs = 0.001;
 // Startup grace: until a HEAD has come back, the gate stays open for the
 // first startupGraceSecs after the first burst (sysexStartedAt).
 var startupGraceSecs = 2.0, sysexStartedAt;
@@ -709,9 +695,9 @@ applyDefaults = {
 // Outgoing SysEx queue. Every packet goes through queueSysex, and the
 // flush routine (started just before the boot, stopped in cleanup) sends
 // what is pending every 200 ms as one burst: the packets back to back,
-// handed to the MIDI layer by sendSysexBytes (macOS: MIDIOut.write
-// packets; Linux: one MIDIOut.sysex call; Windows: one MIDIOut.sysex call
-// per packet). Why bursts: every send call has an overhead of its own,
+// handed to the MIDI layer by sendSysexBytes (one MIDIOut.sysex call per
+// burst; on Windows one per packet). Why bursts: every send call has an
+// overhead of its own,
 // so a few calls a second carrying several packets each cost less than
 // one call per packet, and HEAD, a snapshot, needs to go out only about 5
 // times a second. Packet bytes are unchanged; a receiver only has to
@@ -752,23 +738,18 @@ headKey = { |bytes, i = 0|
 
 // Hands `bytes` -- one burst, or on Windows one packet -- to the MIDI
 // layer; answers whether it went through.
-//   - macOS: as MIDIOut.write packets of up to 3 bytes each, in order
-//     (CoreMIDI's MIDISend), not MIDIOut.sysex: that one calls
+//   - macOS and Linux: one MIDIOut.sysex call per burst. On macOS that is
 //     MIDISendSysex, which paces sends to roughly MIDI-cable speed (~3 KB/s
-//     measured here), below the engine's ~3.7 KB/s peak, while MIDISend
-//     packets are immediate (> 3.3 KB/s sustained with no backlog). SysEx
-//     may span any number of packets, and CoreMIDI reassembles it.
-//     MIDIOut.write takes a packet's first byte as status
-//     (high nibble) plus channel (low nibble) and just recombines them,
-//     so any byte -- F0, a data byte, F7 -- passes unchanged, and a packet
-//     may hold the end of one frame and the start of the next. Measured
-//     on the IAC bus: HEAD, GRAIN and DUMP frames sent this way arrive
-//     intact and in order within about 10 ms, and 3.3 KB/s for 20 s
-//     arrived complete with HEADs 10-40 ms behind. The first failed write
-//     fails the whole burst.
-//   - Linux and Windows: MIDIOut.write sends only short messages there, so
-//     SysEx goes through MIDIOut.sysex (ALSA sends the burst as one SysEx
-//     event; on Windows flushSysex calls this once per packet).
+//     measured here), below the engine's ~3.7 KB/s peak -- hence the byte
+//     budget and the closed loop below. MIDIOut.write (MIDISend packets)
+//     would be faster but CANNOT carry SysEx: it reassembles each 3-byte
+//     chunk as a short message, so a data byte in a chunk's first position
+//     becomes a fake status byte (0x40..0x7F -> note/CC/...) and receivers
+//     see random controls and broken frames. Verified on the IAC bus with
+//     a raw CoreMIDI listener.
+//   - Windows: one MIDIOut.sysex call per packet (flushSysex calls this
+//     once per packet), because PortMidi sends a sysex buffer only up to
+//     its first F7.
 // A failed send (e.g. the port disappeared) posts one warning, the first
 // time only, instead of stopping the flush routine. The reason is
 // flattened to one line: a failed primitive's errorString is
@@ -776,14 +757,7 @@ headKey = { |bytes, i = 0|
 sendSysexBytes = { |bytes|
 	var ok = true;
 	try {
-		if (sysexViaWrite) {
-			bytes.clump(3).do({ |c|
-				var first = c[0] & 255;
-				midiOut.write(c.size, first & 0xF0, first & 0x0F, (c[1] ? 0) & 255, (c[2] ? 0) & 255);
-			});
-		} {
-			midiOut.sysex(bytes);
-		};
+		midiOut.sysex(bytes);
 	} { |err|
 		var why = if (err.isKindOf(Exception)) { err.errorString } { err.asString };
 		ok = false;
@@ -807,10 +781,8 @@ sendSysexBytes = { |bytes|
 // Anything handed over faster than the driver delivers it backs up inside
 // the OS, where the engine can't see it. Measured on the IAC bus (macOS):
 // MIDISendSysex (MIDIOut.sysex) paces sends to roughly MIDI-cable speed
-// (~3 KB/s measured here), below the engine's ~3.7 KB/s peak; MIDISend
-// packets (MIDIOut.write, used on macOS) are immediate (> 3.3 KB/s
-// sustained with no backlog, HEADs 10-40 ms behind). ALSA and loopMIDI
-// weren't measured. So instead of guessing, the engine measures. It
+// (~3 KB/s measured here), below the engine's ~3.7 KB/s peak. ALSA and
+// loopMIDI weren't measured. So instead of guessing, the engine measures. It
 // listens on every MIDI input (MIDIIn.connectAll), so on a bus that loops
 // back -- IAC, loopMIDI -- it hears its own packets:
 //   - flushSysex notes when it hands each HEAD over (headsInFlight: send
@@ -974,11 +946,8 @@ headHeardBack = { |key|
 //     modelBurstSecs plus modelByteSecs per byte (a burst carrying a
 //     reply's DUMP chunk only modelBurstSecs, so answering a request
 //     doesn't close the gate):
-//       - macOS (the packet path): 10 ms + 0.3 ms per byte, from the IAC
-//         measurements above.
-//       - Linux and Windows (MIDIOut.sysex): 60 ms + 1 ms per byte, an
-//         estimate, not measured on those platforms, so there the model
-//         is only a rough guard.
+//       - 60 ms + 1 ms per byte on every platform (MIDIOut.sysex): an
+//         estimate, not measured, so the model is only a rough guard.
 //     The model runs down whenever a burst costs less than the time
 //     between bursts: on Linux and Windows every burst within the budget
 //     does (120 bytes cost 180 ms of the 200 ms; a late burst's larger
@@ -1014,10 +983,8 @@ dumpPacket = { |ci|
 // One burst: sends what is pending, if anything is, and empties the queue
 // even if the send fails, so a dead port can't make it grow. Called by
 // the flush routine every sysexFlushInterval (200 ms).
-//   - Byte budget: sysexBudgetBytes per burst -- 800 B on macOS (about
-//     4,000 B/s, above the ~3.7 KB/s the taps produce at most, so only a
-//     safety net), 120 B elsewhere (about 600 B/s, a conservative estimate
-//     for the SysEx path, not measured on those platforms) -- per
+//   - Byte budget: sysexBudgetBytes per burst -- 120 B (about 600 B/s, a
+//     conservative estimate for the SysEx path) -- per
 //     sysexFlushInterval of real time since the previous burst: when the
 //     routine wakes late (more than 200 ms of real time has passed), the
 //     burst's budget is scaled by that time, between 1 and 3 times
