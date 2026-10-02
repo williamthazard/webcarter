@@ -949,11 +949,9 @@ headHeardBack = { |key|
 //       - 60 ms + 1 ms per byte on every platform (MIDIOut.sysex): an
 //         estimate, not measured, so the model is only a rough guard.
 //     The model runs down whenever a burst costs less than the time
-//     between bursts: on Linux and Windows every burst within the budget
-//     does (120 bytes cost 180 ms of the 200 ms; a late burst's larger
-//     budget is charged over the time it covers, so it runs down too --
-//     see flushSysex); on macOS a burst costs less than 200 ms up to about
-//     630 bytes, which only bursts near maximum density exceed.
+//     between bursts: every burst within the budget does (120 bytes cost
+//     180 ms of the 200 ms; a late burst's larger budget is charged over
+//     the time it covers, so it runs down too -- see flushSysex).
 portBacklog = { |now|
 	var backlog;
 	dropLostHeads.(now);
@@ -998,9 +996,9 @@ dumpPacket = { |ci|
 //     reported; at defaults (7-20 grains a second) all but a few percent
 //     are, dropped when the taps' triggers line up.
 //   - Backlog gate, with hysteresis (see portBacklog): once the port is
-//     more than gateCloseSecs (0.5 s on macOS, 0.35 s elsewhere) behind,
-//     bursts carry no GRAINs until it is back under gateOpenSecs (0.3 s;
-//     0.25 s). While the port is far behind (portFarBehind: HEADs coming
+//     more than gateCloseSecs (0.35 s) behind, bursts carry no GRAINs
+//     until it is back under gateOpenSecs (0.25 s). While the port is far
+//     behind (portFarBehind: HEADs coming
 //     back and the measured backlog over farBehindSecs, 1 s, or the loop
 //     gone quiet), bursts carry no COLUMNs either -- they are dropped, and
 //     the waveform catches up from later COLUMNs or the next request's
