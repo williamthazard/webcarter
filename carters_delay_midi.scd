@@ -349,6 +349,9 @@ MIDIClient.sources.do({ |src, idx|
 // Configure Server memory
 s.options.memSize = 2.pow(20);
 
+// Configure output device manually
+//Server.default.options.outDevice_("External Headphones");
+
 // Base Carter's Delay rates (Forward by default)
 baseCarterRates = [1/4, 1/2, 1, 3/2, 2];
 
